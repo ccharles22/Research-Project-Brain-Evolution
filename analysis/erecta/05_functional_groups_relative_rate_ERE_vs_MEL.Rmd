@@ -1,5 +1,5 @@
 ---
-title: "06. Independent FlyBase Functional-Group Relative-Rate Analysis: ERE vs SAN vs SUZ"
+title: "05. Independent FlyBase Functional-Group Relative-Rate Analysis: ERE vs MEL vs SUZ"
 author: "Candice Charles"
 date: "`r Sys.Date()`"
 output:
@@ -8,10 +8,10 @@ output:
     toc_float: true
     number_sections: true
 params:
-  tpm_file: "D:/Bioinformatics/treeexp_LA_TPM_gt1_all_species.txt"
+  tpm_file: "../../data/processed/treeexp_LA_TPM_gt1_all_species.txt"
   candidate_dir: "D:/Bioinformatics"
-  comparison: "SAN"
-  output_dir: "."
+  comparison: "MEL"
+  output_dir: "../../results/erecta"
   null_repeats: 1000
   logo_top_fraction: 0.05
   min_group_size: 3
@@ -98,7 +98,7 @@ group_maps <- lapply(names(group_files),function(g) map_group(g,group_files[[g]]
 # Report source IDs, matched genes, failed IDs, and mapping rates for every group.
 mapping_summary <- bind_rows(lapply(group_maps,function(z) data.frame(group=z$group,source_file=basename(z$source_file),source_ids=nrow(z$source),matched_genes=length(z$matched),failed_ids=length(z$failed),mapping_rate=length(unique(z$matched))/max(1,nrow(z$source)),mapping_attention=length(unique(z$matched))/max(1,nrow(z$source)) < 0.5,transcriptome_fraction=length(z$matched)/max(1,nrow(expr)),large_category_flag=length(z$matched)/max(1,nrow(expr)) >= 0.5)))
 failed_mapping <- bind_rows(lapply(group_maps,function(z) if(length(z$failed)) data.frame(group=z$group,source_file=basename(z$source_file),FBgn=z$failed,stringsAsFactors=FALSE) else data.frame(group=character(),source_file=character(),FBgn=character(),stringsAsFactors=FALSE)))
-write.csv(mapping_summary,file.path(params$output_dir,"06_independent_group_mapping_summary.csv"),row.names=FALSE); write.csv(failed_mapping,file.path(params$output_dir,"06_independent_group_failed_FlyBase_IDs.csv"),row.names=FALSE)
+write.csv(mapping_summary,file.path(params$output_dir,"05_independent_group_mapping_summary.csv"),row.names=FALSE); write.csv(failed_mapping,file.path(params$output_dir,"05_independent_group_failed_FlyBase_IDs.csv"),row.names=FALSE)
 knitr::kable(mapping_summary,digits=3,caption="Independent FlyBase group mapping summary")
 knitr::kable(utils::head(failed_mapping,100),caption="First 100 failed FlyBase IDs")
 large_categories <- mapping_summary %>% dplyr::filter(large_category_flag)
@@ -144,8 +144,7 @@ knitr::kable(group_results, digits = 5, caption = paste("Independent FlyBase cat
 
 ## Compare all group Z-scores
 
-```{r zscore_plot, fig.width=12, fig.height=8}
-# Display the baseline and all twelve group Z-scores in one clearly labelled figure.
+```{r zscore_plot, fig.width=14, fig.height=10}
 plot_data <- all_results %>%
   filter(is.finite(z_score)) %>%
   mutate(
@@ -160,13 +159,11 @@ plot_data <- all_results %>%
     z_label = sprintf("Z = %.2f", z_score)
   )
 
-# Give the Z-score labels their own column to the right of every bar.
+# Use one fixed position for the Z-score labels so they cannot overlap
+# the category names on the left.
 z_label_x <- max(c(0, plot_data$z_score), na.rm = TRUE) + 0.35
 
-p_z <- ggplot(
-  plot_data,
-  aes(x = z_score, y = label, fill = group_type)
-) +
+p_z <- ggplot(plot_data, aes(x = z_score, y = label, fill = group_type)) +
   geom_col(width = 0.65) +
   geom_text(
     aes(x = z_label_x, label = z_label),
@@ -184,7 +181,7 @@ p_z <- ggplot(
   ) +
   labs(
     title = "ERE relative-rate Z-scores",
-    subtitle = "ERE is compared with SAN; SUZ is the outgroup.",
+    subtitle = "ERE is compared with MEL; SUZ is the outgroup.",
     x = "Z-score",
     y = NULL,
     fill = "Group type"
@@ -233,7 +230,7 @@ p_z <- ggplot(
 print(p_z)
 
 ggsave(
-  file.path(params$output_dir, "06_independent_group_zscores.png"),
+  file.path(params$output_dir, "05_independent_group_zscores.png"),
   p_z,
   width = 14,
   height = 10,
@@ -241,7 +238,7 @@ ggsave(
 )
 
 knitr::include_graphics(
-  file.path(params$output_dir, "06_independent_group_zscores.png")
+  file.path(params$output_dir, "05_independent_group_zscores.png")
 )
 ```
 
@@ -250,18 +247,18 @@ knitr::include_graphics(
 ```{r logo}
 # Remove each gene once and record how much it changes the group's distance contrast.
 logo_one_group <- function(z){ ids <- unique(z$matched); n <- length(ids); if(n < params$min_group_size) return(data.frame()); full <- delta(expr[ids,,drop=FALSE]); bind_rows(lapply(ids,function(g){keep <- setdiff(ids,g); loo <- delta(expr[keep,,drop=FALSE]); data.frame(group=z$group,group_type=if(grepl("^GO_",z$group)) "GO term" else "FlyBase set",source_file=basename(z$source_file),gene_id=g,group_size=n,full_delta=full,loo_delta=loo,logo_influence=full-loo,positive=(full-loo)>0,stringsAsFactors=FALSE)})) %>% group_by(group) %>% mutate(rank=rank(-logo_influence,ties.method="first"),rank_fraction=rank/group_size) %>% ungroup() }
-logo <- bind_rows(lapply(group_maps,logo_one_group)); write.csv(logo,file.path(params$output_dir,"06_independent_group_LOGO_rankings.csv"),row.names=FALSE); knitr::kable(utils::head(logo,100),digits=4,caption="Leave-one-gene-out influence results")
+logo <- bind_rows(lapply(group_maps,logo_one_group)); write.csv(logo,file.path(params$output_dir,"05_independent_group_LOGO_rankings.csv"),row.names=FALSE); knitr::kable(utils::head(logo,100),digits=4,caption="Leave-one-gene-out influence results")
 ```
 
 ```{r recurring}
 # Summarise genes that are positive top contributors in at least two groups.
 recurring <- logo %>% filter(positive,rank_fraction<=params$logo_top_fraction) %>% group_by(gene_id) %>% summarise(n_groups=n_distinct(group),groups=paste(sort(unique(group)),collapse="; "),best_rank_fraction=min(rank_fraction),mean_influence=mean(logo_influence),max_influence=max(logo_influence),.groups="drop") %>% filter(n_groups>=2) %>% mutate(SYMBOL=sub("_OG.*$","",gene_id)) %>% arrange(desc(n_groups),best_rank_fraction,desc(mean_influence))
-write.csv(recurring,file.path(params$output_dir,"06_independent_recurring_positive_driver_genes.csv"),row.names=FALSE); knitr::kable(recurring,digits=4,caption="Recurring positive contributors")
+write.csv(recurring,file.path(params$output_dir,"05_independent_recurring_positive_driver_genes.csv"),row.names=FALSE); knitr::kable(recurring,digits=4,caption="Recurring positive contributors")
 ```
 
 ```{r recurring_plot, fig.width=10, fig.height=7}
 # Render the recurring-contributor bar chart when at least one gene recurs.
-if(nrow(recurring)){ plot_recurring <- recurring %>% slice_head(n=25) %>% mutate(plot_label=make.unique(as.character(SYMBOL))) %>% mutate(plot_label=factor(plot_label,levels=rev(plot_label))); p_rec <- ggplot(plot_recurring,aes(plot_label,n_groups))+geom_col(fill="#0072B2")+coord_flip()+theme_minimal(base_size=11)+labs(title="Recurring positive contributors",x=NULL,y="Number of groups"); print(p_rec); ggsave(file.path(params$output_dir,"06_independent_recurring_driver_gene_counts.png"),p_rec,width=10,height=7,dpi=300); knitr::include_graphics(file.path(params$output_dir,"06_independent_recurring_driver_gene_counts.png")) } else cat("No gene was a positive top contributor in at least two groups.
+if(nrow(recurring)){ plot_recurring <- recurring %>% slice_head(n=25) %>% mutate(plot_label=make.unique(as.character(SYMBOL))) %>% mutate(plot_label=factor(plot_label,levels=rev(plot_label))); p_rec <- ggplot(plot_recurring,aes(plot_label,n_groups))+geom_col(fill="#0072B2")+coord_flip()+theme_minimal(base_size=11)+labs(title="Recurring positive contributors",x=NULL,y="Number of groups"); print(p_rec); ggsave(file.path(params$output_dir,"05_independent_recurring_driver_gene_counts.png"),p_rec,width=10,height=7,dpi=300); knitr::include_graphics(file.path(params$output_dir,"05_independent_recurring_driver_gene_counts.png")) } else cat("No gene was a positive top contributor in at least two groups.
 ")
 ```
 
@@ -269,7 +266,7 @@ if(nrow(recurring)){ plot_recurring <- recurring %>% slice_head(n=25) %>% mutate
 
 ```{r reproducibility}
 # Save the analysis settings and display the session information.
-parameters <- data.frame(parameter=c("null_repeats","min_group_size","logo_top_fraction","seed"),value=c(params$null_repeats,params$min_group_size,params$logo_top_fraction,params$seed)); write.csv(parameters,file.path(params$output_dir,"06_independent_analysis_parameters.csv"),row.names=FALSE); knitr::kable(parameters); sessionInfo()
+parameters <- data.frame(parameter=c("null_repeats","min_group_size","logo_top_fraction","seed"),value=c(params$null_repeats,params$min_group_size,params$logo_top_fraction,params$seed)); write.csv(parameters,file.path(params$output_dir,"05_independent_analysis_parameters.csv"),row.names=FALSE); knitr::kable(parameters); sessionInfo()
 ```
 
 

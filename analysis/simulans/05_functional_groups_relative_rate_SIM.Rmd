@@ -8,12 +8,12 @@ output:
     toc_float: true
     number_sections: true
 params:
-  tpm_file: "treeexp_LA_TPM_gt1_all_species.txt"
+  tpm_file: "../../data/processed/treeexp_LA_TPM_gt1_all_species.txt"
   go_dir: "D:/Bioinformatics"
   neuropeptide_file: "D:/Bioinformatics/FlyBase_Fields_download (Neuropeptides).txt"
   transcription_factor_file: "D:/Bioinformatics/FlyBase_Fields_download (Transcription factors).txt"
   nervous_system_file: "D:/Bioinformatics/Nervous System Process.txt"
-  output_dir: "."
+  output_dir: "../../results/simulans"
   null_repeats: 1000
   logo_top_fraction: 0.05
   min_group_size: 3

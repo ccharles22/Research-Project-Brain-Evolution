@@ -3,7 +3,7 @@ title: "LA Relative Rate Tests for Erecta"
 author: "Candice Charles"
 date: "`r Sys.Date()`"
 params:
-  input_la_tpm_file: "treeexp_LA_TPM_gt1_all_species.txt"
+  input_la_tpm_file: "../../data/processed/treeexp_LA_TPM_gt1_all_species.txt"
 output:
   html_document:
     code_folding: hide

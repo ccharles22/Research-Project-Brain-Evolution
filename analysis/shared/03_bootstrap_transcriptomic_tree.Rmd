@@ -3,8 +3,8 @@ title: "03. Bootstrap Whole-Transcriptome Tree"
 author: "Candice Charles"
 date: "`r Sys.Date()`"
 params:
-  input_tpm_file: "../../File_S3_spp_tpm_1to1s.txt"
-  output_dir: "results/treeexp"
+  input_tpm_file: "../../../File_S3_spp_tpm_1to1s.txt"
+  output_dir: "../../results/treeexp"
   tree_bootstrap_replicates: 100
   seed: 1
 output:
