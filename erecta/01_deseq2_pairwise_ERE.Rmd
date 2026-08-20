@@ -1,0 +1,477 @@
+﻿---
+title: "01. DESeq2 Pairwise Differential Expression - D. erecta"
+author: "Candice Charles"
+date: "2026-07-01"
+params:
+  count_dir: "D:/Bioinformatics"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: united
+    highlight: tango
+    number_sections: true
+    toc_depth: 3
+    code_folding: hide
+    df_print: paged
+  mathjax: null
+  pdf_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+# Show code in the report and hide package startup noise
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Introduction
+
+1. Imports and merges the six species count files.
+2. Fits the DESeq2 model with `Dere` as the reference.
+3. Runs every species-versus-`Dere` contrast.
+4. Produces volcano plots and complete significant-gene heatmaps.
+5. Saves the objects required by the separate GO enrichment report.
+
+---
+
+The strict sensitivity result calls `results()` a second time because DESeq2 re-optimises independent filtering for each alpha; simply re-thresholding the original adjusted p-values would not be equivalent.
+
+## Load Required Libraries
+
+```{r load_libraries}
+required_packages <- c("DESeq2", "apeglm", "readxl", "dplyr", "ggplot2", "pheatmap", "tibble", "readr")
+missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_packages) > 0) stop("Missing packages: ", paste(missing_packages, collapse = ", "), ". Restore the project environment with renv::restore().")
+suppressPackageStartupMessages({ library(DESeq2); library(apeglm); library(readxl); library(dplyr); library(ggplot2); library(pheatmap); library(tibble); library(readr) })
+
+# Write a CSV normally, but use a timestamped filename if Windows locks the target.
+safe_write_csv <- function(x, file, row.names = FALSE) {
+  # Create the destination folder before attempting to write.
+  dir.create(dirname(file), recursive = TRUE, showWarnings = FALSE)
+
+  # Try the requested path and fall back safely when Excel or OneDrive locks it.
+  tryCatch(
+    {
+      utils::write.csv(x, file, row.names = row.names)
+      invisible(file)
+    },
+    error = function(e) {
+      # Build an alternative filename that cannot overwrite an existing result.
+      fallback <- file.path(
+        dirname(file),
+        paste0(
+          tools::file_path_sans_ext(basename(file)),
+          "_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".csv"
+        )
+      )
+
+      # Save to the alternative path and report why it was used.
+      utils::write.csv(x, fallback, row.names = row.names)
+      warning("Original CSV was unavailable; saved instead as: ", fallback)
+      invisible(fallback)
+    }
+  )
+}
+```
+
+---
+
+## Define File Paths
+
+```{r file_paths}
+# Raw count workbooks are excluded from Git. They are currently stored in
+# D:/Bioinformatics. Override `params$count_dir` when rendering if they move.
+files <- c(
+  Dere = file.path(params$count_dir, "Dere_counts.xlsx"),
+  Dmel = file.path(params$count_dir, "Dmel_counts.xlsx"),
+  Dsuz = file.path(params$count_dir, "Dsuz_counts.xlsx"),
+  Dsim = file.path(params$count_dir, "Dsim_counts.xlsx"),
+  Dsec = file.path(params$count_dir, "Dsec_counts.xlsx"),
+  Dsan = file.path(params$count_dir, "Dsan_counts.xlsx")
+)
+
+# Stop before importing anything and report every missing workbook together.
+missing_count_files <- files[!file.exists(files)]
+if (length(missing_count_files) > 0) {
+  stop(
+    paste0(
+      "Missing raw count workbook(s):
+- ",
+      paste(
+        normalizePath(missing_count_files, winslash = "/", mustWork = FALSE),
+        collapse = "
+- "
+      ),
+      "
+Set the YAML parameter `count_dir` to the directory containing all six files."
+    ),
+    call. = FALSE
+  )
+}
+```
+
+---
+
+## Data Import Function
+
+```{r read_function}
+# Read one species file, keep only gene IDs and count columns, and clean the table
+read_species_counts <- function(file) {
+  df <- read_excel(file, sheet = 1)
+  if (!("DmelID" %in% names(df))) stop("Count file lacks DmelID: ", file)
+  count_cols <- setdiff(names(df), c("DmelID", grep("_gene_name$", names(df), value = TRUE)))
+  if (length(count_cols) != 3L) stop("Expected exactly 3 replicate columns in ", file, "; found ", length(count_cols), ".")
+  raw_values <- lapply(df[count_cols], function(v) { txt <- trimws(as.character(v)); txt[is.na(txt) | txt %in% c("", "NA", "NaN", "NULL")] <- NA_character_; txt })
+  before_na <- sum(is.na(as.data.frame(raw_values)))
+  converted <- lapply(raw_values, function(v) suppressWarnings(as.numeric(v)))
+  after_na <- sum(is.na(as.data.frame(converted)))
+  if (after_na > before_na) stop("Non-numeric values introduced during count conversion in ", file)
+  out <- cbind(df["DmelID"], as.data.frame(converted)); names(out) <- c("DmelID", count_cols)
+  out <- out[!is.na(out$DmelID) & out$DmelID != "", , drop=FALSE]
+  has_data <- apply(out[count_cols], 1, function(x) any(!is.na(x) & x != 0))
+  out <- out[has_data & !duplicated(out$DmelID), , drop = FALSE]
+  out
+}
+```
+
+---
+
+## Import and Merge All Species Data
+
+```{r import_data}
+# Read all count tables into a named list
+count_list <- lapply(files, read_species_counts)
+
+# Record which sample column belongs to which species
+column_to_species <- list()
+for (i in seq_along(count_list)) {
+  species_name <- names(files)[i]
+  sample_cols <- setdiff(colnames(count_list[[i]]), "DmelID")
+  for (col in sample_cols) column_to_species[[col]] <- species_name
+}
+
+# Merge species by DmelID and retain only complete cases.
+merged_counts <- Reduce(function(x, y) full_join(x, y, by = "DmelID"), count_list)
+missing_by_species <- data.frame(DmelID=merged_counts$DmelID, stringsAsFactors=FALSE)
+for (sp in names(files)) { cols <- names(column_to_species)[vapply(column_to_species, identical, logical(1), sp)]; missing_by_species[[sp]] <- if(length(cols)) rowSums(is.na(merged_counts[cols])) > 0 else FALSE }
+excluded_genes <- missing_by_species[rowSums(missing_by_species[-1]) > 0, , drop=FALSE]
+safe_write_csv(excluded_genes, "genes_excluded_incomplete_cases_erecta.csv")
+
+ortholog_loss_by_species <- data.frame(
+  species = names(files),
+  genes_missing = vapply(names(files), function(sp) sum(excluded_genes[[sp]]), integer(1)),
+  percent_of_excluded = 100 * vapply(names(files), function(sp) sum(excluded_genes[[sp]]), integer(1)) / max(1, nrow(excluded_genes)),
+  total_library_size = vapply(names(files), function(sp) {
+    cols <- names(column_to_species)[vapply(column_to_species, identical, logical(1), sp)]
+    sum(as.matrix(count_list[[sp]][, cols, drop=FALSE]), na.rm=TRUE)
+  }, numeric(1)),
+  stringsAsFactors = FALSE
+)
+knitr::kable(ortholog_loss_by_species, caption="Ortholog-loss diagnostic by species")
+safe_write_csv(ortholog_loss_by_species, "ortholog_loss_by_species_erecta.csv")
+merged_counts <- merged_counts[rowSums(is.na(merged_counts[-1])) == 0, , drop=FALSE]
+
+cat("Excluded incomplete genes:", nrow(excluded_genes), "; retained complete genes:", nrow(merged_counts), "\
+")
+
+# Convert to a gene x sample count matrix
+count_matrix <- as.data.frame(merged_counts)
+rownames(count_matrix) <- count_matrix$DmelID
+count_matrix$DmelID <- NULL
+count_matrix[] <- lapply(count_matrix, function(x) as.integer(round(x)))
+
+cat("Count matrix:", nrow(count_matrix), "genes x", ncol(count_matrix), "samples
+")
+```
+
+The phylogenetic expectation is that D. santomea, as the closest relative of D. erecta in this panel, should show the fewest missing ortholog counts. The contrast-level DE counts instead place D. santomea third, while D. melanogaster has the fewest differences. The table above reports whether missing-gene counts and total library sizes show a species-specific pattern consistent with a reference-genome effect; it does not by itself establish the cause.
+
+---
+
+## Create Sample Metadata
+
+```{r metadata}
+# Build sample metadata using the original column-to-species mapping
+sample_info <- data.frame(
+  sample = colnames(count_matrix),
+  species = sapply(colnames(count_matrix), function(x) column_to_species[[x]]),
+  row.names = colnames(count_matrix)
+)
+
+# Set Dere as the reference so every log2FC is relative to Dere
+sample_info$species <- factor(sample_info$species)
+sample_info$species <- relevel(sample_info$species, ref = "Dere")
+
+# Make sure sample order matches the count matrix columns
+stopifnot(all(rownames(sample_info) == colnames(count_matrix)))
+
+print(sample_info)
+print(table(sample_info$species))
+```
+
+---
+
+## Create DESeq2 Dataset
+
+```{r create_deseq}
+# Build the DESeq2 object and remove genes with almost no information
+dds <- DESeqDataSetFromMatrix(
+  countData = count_matrix,
+  colData = sample_info,
+  design = ~ species
+)
+
+smallestGroupSize <- min(table(sample_info$species))
+dds <- dds[rowSums(counts(dds) >= 10) >= smallestGroupSize, ]
+cat("Group-aware filter retained:", nrow(dds), "genes")
+```
+
+---
+
+```{r quality_control, fig.cap="Variance-stabilised PCA for the filtered count matrix.", fig.alt="PCA plot showing sample separation by species."}
+vsd_qc <- vst(estimateSizeFactors(dds), blind = TRUE)
+print(plotPCA(vsd_qc, intgroup = "species"))
+```
+## Run DESeq2 Analysis
+
+```{r run_deseq}
+# Estimate size factors, dispersions, and fit the DE model
+dds <- DESeq(dds)
+
+# Save normalized counts for later inspection
+norm_counts <- counts(dds, normalized = TRUE)
+safe_write_csv(
+  as.data.frame(norm_counts),
+  "normalized_counts_all_species2.csv",
+  row.names = TRUE
+)
+
+# Use variance-stabilised counts for the heatmaps.
+vsd_mat <- assay(vst(dds, blind = FALSE))
+
+print(resultsNames(dds))
+```
+
+---
+
+## Quality-control diagnostics
+
+The DESeq2 results use a direct threshold test with `lfcThreshold`: genes are called significant only when the adjusted p-value is below the FDR cutoff and the data support an absolute log2 fold change greater than the specified effect-size threshold. The exported `log2FoldChange` column contains apeglm-shrunken estimates, while `raw_log2FoldChange` preserves the unshrunken MLE for auditability. Among significant genes, direction flags are assigned from the sign of the shrunken estimate; the threshold is not applied a second time.
+
+## Run All Pairwise Comparisons Against Dere
+
+```{r pairwise_results}
+comparison_species <- setdiff(levels(sample_info$species), "Dere")
+padj_cutoff <- 0.10
+strict_padj_cutoff <- 0.05
+strict_lfc_cutoff <- 1.00
+lfc_cutoff <- 0.50
+results_list <- list(); summary_table <- list(); tested_genes_by_contrast <- list()
+for (sp in comparison_species) {
+  coef_name <- grep(paste0("^species_", sp, "_vs_Dere$"), resultsNames(dds), value = TRUE)
+  if (length(coef_name) != 1L) {
+    stop("Expected exactly one coefficient matching ", sp, " vs the reference level; found ", length(coef_name), ". apeglm requires `coef`, so the focal species must be the reference level (check the relevel() call).")
+  }
+  raw_mle <- results(dds, name = coef_name, alpha = padj_cutoff)
+  res <- results(dds, name = coef_name, alpha = padj_cutoff, lfcThreshold = lfc_cutoff, altHypothesis = "greaterAbs")
+  strict_res <- results(dds, name = coef_name, alpha = strict_padj_cutoff, lfcThreshold = strict_lfc_cutoff, altHypothesis = "greaterAbs")
+  shrunk <- lfcShrink(dds, coef = coef_name, res = raw_mle, type = "apeglm")
+  res_df <- as.data.frame(res) %>% rownames_to_column("gene")
+  raw_df <- as.data.frame(raw_mle) %>% rownames_to_column("gene") %>% dplyr::select(gene, raw_log2FoldChange = log2FoldChange, raw_pvalue = pvalue, raw_padj = padj)
+  shr_df <- as.data.frame(shrunk) %>% rownames_to_column("gene") %>% dplyr::select(gene, log2FoldChange)
+  strict_df <- as.data.frame(strict_res) %>% rownames_to_column("gene") %>% dplyr::select(gene, strict_padj = padj)
+  res_df <- res_df %>% dplyr::rename(threshold_log2FoldChange = log2FoldChange, threshold_pvalue = pvalue, threshold_padj = padj) %>% dplyr::left_join(raw_df, by = "gene") %>% dplyr::left_join(shr_df, by = "gene") %>% dplyr::left_join(strict_df, by = "gene") %>% dplyr::mutate(pvalue = threshold_pvalue, padj = threshold_padj, significant = !is.na(threshold_padj) & threshold_padj < padj_cutoff, significant_strict = !is.na(strict_padj) & strict_padj < strict_padj_cutoff, higher_in_Dere = significant & log2FoldChange < 0, lower_in_Dere = significant & log2FoldChange > 0) %>% dplyr::arrange(padj, dplyr::desc(abs(log2FoldChange)))
+  results_list[[sp]] <- res_df
+  tested_genes_by_contrast[[sp]] <- res_df$gene[!is.na(res_df$threshold_pvalue)]
+  summary_table[[sp]] <- data.frame(comparison = paste0(sp, "_vs_Dere"), genes_tested = sum(!is.na(res_df$threshold_pvalue)), cook_distance_outliers = sum(is.na(raw_mle$pvalue) & !is.na(raw_mle$log2FoldChange)), low_count_independent_filtering = sum(is.na(raw_mle$pvalue) & is.na(raw_mle$log2FoldChange)), significant_genes = sum(res_df$significant, na.rm = TRUE), significant_genes_strict = sum(res_df$significant_strict, na.rm = TRUE), higher_in_Dere = sum(res_df$higher_in_Dere, na.rm = TRUE), lower_in_Dere = sum(res_df$lower_in_Dere, na.rm = TRUE))
+  safe_write_csv(res_df, paste0("DESeq2_", sp, "_vs_Dere.csv"), row.names = FALSE)
+}
+contrast_summary <- dplyr::bind_rows(summary_table)
+stopifnot(all(contrast_summary$significant_genes == contrast_summary$higher_in_Dere + contrast_summary$lower_in_Dere))
+zero_shrunken_by_contrast <- dplyr::bind_rows(lapply(names(results_list), function(sp) data.frame(comparison = paste0(sp, "_vs_Dere"), significant_shrunken_log2FC_exactly_zero = sum(results_list[[sp]]$significant & results_list[[sp]]$log2FoldChange == 0, na.rm = TRUE))))
+zero_shrunken_by_contrast
+contrast_summary
+```
+```{r volcano_plots, fig.width=8, fig.height=6, fig.cap="Volcano plots for each species relative to D. erecta.", fig.alt="Volcano plots showing log2 fold changes and adjusted p-values for each species-versus-D. erecta contrast."}
+# Full scientific names used in plot labels.
+species_names <- c(
+  Dere = "D. erecta",
+  Dmel = "D. melanogaster",
+  Dsim = "D. simulans",
+  Dsec = "D. sechellia",
+  Dsan = "D. santomea",
+  Dsuz = "D. suzukii"
+)
+
+# Set these three values according to the script's reference species.
+reference_code <- "Dere"
+reference_label <- species_names[[reference_code]]
+higher_reference_column <- "higher_in_Dere"
+lower_reference_column <- "lower_in_Dere"
+
+plot_volcano <- function(x, sp) {
+
+  comparison_label <- species_names[[sp]]
+
+  d <- x %>%
+    mutate(
+      y = -log10(pmax(padj, 1e-300)),
+      status = case_when(
+        .data[[higher_reference_column]] ~
+          paste("Higher in", reference_label),
+        .data[[lower_reference_column]] ~
+          paste("Higher in", comparison_label),
+        TRUE ~ "Not significant"
+      )
+    )
+
+  plot_title <- bquote(
+    italic(.(reference_label)) ~ "vs" ~ italic(.(comparison_label))
+  )
+
+  ggplot(d, aes(log2FoldChange, y, colour = status)) +
+    geom_point(alpha = 0.80, size = 2.5) +
+    geom_vline(
+      xintercept = c(-lfc_cutoff, lfc_cutoff),
+      linetype = "dashed",
+      colour = "grey40"
+    ) +
+    geom_hline(
+      yintercept = -log10(padj_cutoff),
+      linetype = "dashed",
+      colour = "red4"
+    ) +
+    theme_minimal(base_size = 16) +
+    labs(
+      title = plot_title,
+      x = "Shrunken log2 fold change",
+      y = "-log10 adjusted p-value",
+      colour = NULL
+    ) +
+    theme(
+      plot.title = element_text(size = 16),
+      axis.title = element_text(size = 16),
+      axis.text = element_text(size = 14),
+      legend.text = element_text(size = 16)
+    ) +
+    guides(colour = guide_legend(override.aes = list(size = 3)))
+}
+
+for (sp in comparison_species) {
+  print(plot_volcano(results_list[[sp]], sp))
+}
+```
+
+---
+
+## Heatmaps for All Comparisons
+
+```{r all_heatmaps, fig.width=9, fig.height=10, fig.cap="Top-75 significant-gene heatmaps; complete matrices are supplied as CSV files for each D. erecta contrast.", fig.alt="Scaled expression heatmaps for significant genes in each species-versus-D. erecta comparison."}
+# Create a folder for complete scaled heatmap matrices and gene-order tables.
+heatmap_output_dir <- "all_significant_gene_heatmaps2"
+dir.create(heatmap_output_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Draw one heatmap per contrast using every significant gene from that contrast.
+for (sp in comparison_species) {
+  # Retrieve the complete differential-expression table for this comparison.
+  res_df <- results_list[[sp]]
+
+  # Keep all significant genes, ordered by adjusted p-value before clustering.
+  heatmap_genes <- res_df %>%
+    dplyr::filter(significant) %>%
+    dplyr::arrange(padj, dplyr::desc(abs(log2FoldChange))) %>%
+    dplyr::pull(gene)
+
+  # Skip the plot cleanly if a contrast has fewer than two significant genes.
+  if (length(heatmap_genes) < 2) {
+    cat("Skipping heatmap for", sp, "because fewer than 2 significant genes were found.
+")
+    next
+  }
+
+  # Keep samples from D. erecta and the focal comparison species.
+  keep_samples <- rownames(sample_info)[sample_info$species %in% c("Dere", sp)]
+  heat_mat <- vsd_mat[heatmap_genes, keep_samples, drop = FALSE]
+
+  # Remove zero-variance genes because row scaling would convert them to NA values.
+  row_sd <- apply(heat_mat, 1, stats::sd, na.rm = TRUE)
+  variable_rows <- is.finite(row_sd) & row_sd > 0
+  heat_mat <- heat_mat[variable_rows, , drop = FALSE]
+
+  # Skip safely if fewer than two variable genes remain after quality control.
+  if (nrow(heat_mat) < 2) {
+    cat("Skipping heatmap for", sp, "because fewer than 2 variable genes remain.
+")
+    next
+  }
+
+  # Standardise each gene so heatmap colours represent relative expression.
+  heat_mat <- t(scale(t(heat_mat)))
+
+  # Export the complete scaled matrix so every plotted gene remains reviewable.
+  safe_write_csv(
+    as.data.frame(heat_mat),
+    file.path(heatmap_output_dir, paste0(sp, "_vs_Dere_ALL_significant_heatmap_matrix.csv")),
+    row.names = TRUE
+  )
+
+  # The CSV above retains every significant gene; the plotted heatmap is capped at the top 75 for readability.
+  heat_mat <- heat_mat[seq_len(min(75, nrow(heat_mat))), , drop = FALSE]
+  # Scale row labels automatically between 1 and 10 points for improved readability.
+  heatmap_fontsize <- max(1, min(10, 600 / nrow(heat_mat)))
+
+  # Draw the complete heatmap; clustering determines the displayed gene order.
+  heatmap_obj <- pheatmap(
+    heat_mat,
+    annotation_col = sample_info[keep_samples, "species", drop = FALSE],
+    show_rownames = TRUE, show_colnames = TRUE, fontsize_row = heatmap_fontsize, border_color = NA,
+    main = paste("Top 75 significant DE genes:", sp, "vs Dere"), silent = TRUE
+  )
+  grid::grid.newpage(); grid::grid.draw(heatmap_obj$gtable)
+  png(file.path(heatmap_output_dir, paste0(sp, "_vs_Dere_ALL_significant_heatmap.png")), width=900, height=1000, res=120)
+  grid::grid.newpage(); grid::grid.draw(heatmap_obj$gtable); invisible(dev.off())
+}
+```
+
+---
+
+## Save Inputs for Part 2 - Erecta
+
+The second report loads one compact RDS file, so the DESeq2 model does not need
+to be fitted again before GO enrichment.
+
+```{r save_go_handoff}
+# Store only the objects required by the separate GO enrichment report.
+go_input_objects <- list(
+  results_list = results_list,
+  comparison_species = comparison_species,
+  tested_genes_by_contrast = tested_genes_by_contrast,
+  padj_cutoff = padj_cutoff,
+  lfc_cutoff = lfc_cutoff
+)
+
+# Save the reusable handoff file beside both R Markdown documents.
+saveRDS(go_input_objects, "deseq2_GO_input_objects.rds2")
+
+# Confirm where the handoff file was saved and how many contrasts it contains.
+data.frame(
+  handoff_file = normalizePath(
+    "deseq2_GO_input_objects.rds2",
+    winslash = "/",
+    mustWork = FALSE
+  ),
+  tested_genes_by_contrast = vapply(go_input_objects$tested_genes_by_contrast, length, integer(1)),
+  contrasts = length(go_input_objects$results_list)
+)
+```
+
+
+## Reproducibility
+
+<details><summary>Session information</summary>
+
+```{r session_info}
+sessionInfo()
+```
+
+</details>

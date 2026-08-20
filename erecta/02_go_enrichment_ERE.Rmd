@@ -1,0 +1,736 @@
+﻿---
+title: "GO Enrichment - Erecta"
+author: "Candice Charles"
+date: "2026-07-01"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: united
+    highlight: tango
+    number_sections: true
+    toc_depth: 3
+    code_folding: hide
+    df_print: paged
+  mathjax: null
+  pdf_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+# Show code while suppressing package startup messages and warnings in the report.
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Introduction
+
+This second report loads the DESeq2 results produced by Part 1, creates the
+majority-supported, upregulated-in-*D. erecta*, and downregulated-in-*D. erecta* gene
+intersections, performs GO Biological Process enrichment, exports every result,
+and visualises all significant terms as size-ranked bar charts.
+
+Differential-expression calls use BH-adjusted p < 0.10, whereas GO enrichment uses BH-adjusted p ≤ 0.05 (`go_fdr`); the stricter GO threshold limits false-positive functional annotations after testing many ontology terms.
+
+---
+
+## Load Required Libraries
+
+```{r load_libraries}
+required_packages <- c("dplyr", "ggplot2", "stringr", "tibble", "clusterProfiler", "enrichplot", "org.Dm.eg.db", "AnnotationDbi", "GOSemSim")
+missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_packages) > 0) stop("Missing packages: ", paste(missing_packages, collapse = ", "), ". Restore the project environment with renv::restore().")
+
+# Load the packages used by the GO workflow and visualisations.
+library(dplyr)
+library(ggplot2)
+library(stringr)
+library(clusterProfiler)
+library(org.Dm.eg.db)
+library(AnnotationDbi)
+
+# Write a CSV normally, but use a timestamped filename if Windows locks the target.
+safe_write_csv <- function(x, file, row.names = FALSE) {
+  # Create the destination folder before attempting to write.
+  dir.create(dirname(file), recursive = TRUE, showWarnings = FALSE)
+
+  # Try the requested path and fall back safely when Excel or OneDrive locks it.
+  tryCatch(
+    {
+      utils::write.csv(x, file, row.names = row.names)
+      invisible(file)
+    },
+    error = function(e) {
+      # Build a unique alternative filename for a locked output.
+      fallback <- file.path(
+        dirname(file),
+        paste0(
+          tools::file_path_sans_ext(basename(file)),
+          "_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".csv"
+        )
+      )
+
+      # Save the result to the fallback path and report the change.
+      utils::write.csv(x, fallback, row.names = row.names)
+      warning("Original CSV was unavailable; saved instead as: ", fallback)
+      invisible(fallback)
+    }
+  )
+}
+```
+
+---
+
+## Load DESeq2 Results from Part 1
+
+```{r load_go_handoff}
+# Specify the handoff file created at the end of Part 1.
+go_input_file <- "deseq2_GO_input_objects.rds2"
+
+# Stop with a clear instruction if Part 1 has not created the handoff file.
+if (!file.exists(go_input_file)) {
+  stop("Run Part 1 first; the file deseq2_GO_input_objects.rds2 was not found.")
+}
+
+# Load the saved DESeq2 results and tested-gene universe.
+go_input_objects <- readRDS(go_input_file)
+results_list <- go_input_objects$results_list
+comparison_species <- go_input_objects$comparison_species
+tested_genes_by_contrast <- go_input_objects$tested_genes_by_contrast
+tested_genes <- Reduce(intersect, tested_genes_by_contrast)
+padj_cutoff <- go_input_objects$padj_cutoff
+lfc_cutoff <- go_input_objects$lfc_cutoff
+
+# Verify that the handoff contains the objects required for GO enrichment.
+stopifnot(
+  is.list(results_list),
+  length(results_list) > 0,
+  length(tested_genes_by_contrast) > 0,
+  all(lengths(tested_genes_by_contrast) > 0),
+  length(tested_genes) > 0
+)
+
+# Display a compact handoff summary before beginning enrichment.
+data.frame(
+  tested_genes = length(tested_genes),
+  tested_genes_by_contrast = vapply(tested_genes_by_contrast, length, integer(1)),
+  contrasts = length(results_list),
+  adjusted_p_cutoff = padj_cutoff,
+  log2_fold_change_cutoff = lfc_cutoff
+)
+```
+
+---
+
+## Define the Three Cross-Contrast Gene Groups
+
+```{r overlap_genes}
+# Store all GO-related tables and figures in one folder to keep the project tidy.
+go_output_dir <- "GO_three_groups_results2"
+dir.create(go_output_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Require support in at least half the contrasts, with a minimum of two contrasts.
+min_overlap <- min(length(results_list), max(2, ceiling(length(results_list) / 2)))
+
+# Define the three groups once so the same reusable code can process each group.
+genes_by_group <- list(
+  majority_supported_DE = lapply(results_list, function(x) unique(x$gene[x$significant %in% TRUE])),
+  upregulated_in_Dere = lapply(results_list, function(x) unique(x$gene[x$higher_in_Dere %in% TRUE])),
+  downregulated_in_Dere = lapply(results_list, function(x) unique(x$gene[x$lower_in_Dere %in% TRUE]))
+)
+
+# Preserve contrast names inside every group for transparent intersection tracking.
+genes_by_group <- lapply(
+  genes_by_group,
+  function(x) stats::setNames(x, names(results_list))
+)
+
+# Count the number of supporting contrasts for every gene in one group.
+count_gene_support <- function(contrast_lists) {
+  sort(table(unlist(contrast_lists, use.names = FALSE)), decreasing = TRUE)
+}
+
+# Apply the support-count function to all three groups.
+support_counts <- lapply(genes_by_group, count_gene_support)
+
+# Retain genes meeting the relaxed intersection threshold for GO enrichment.
+go_gene_sets <- lapply(
+  support_counts,
+  function(x) names(x)[as.integer(x) >= min_overlap]
+)
+
+# Also calculate strict intersections supported by every contrast for review.
+strict_gene_sets <- lapply(genes_by_group, function(x) Reduce(intersect, x))
+
+# Create a complete audit table showing exactly which contrasts support each gene.
+make_intersection_table <- function(contrast_lists, group_name) {
+  # Collect every unique gene observed in this group.
+  all_genes <- sort(unique(unlist(contrast_lists, use.names = FALSE)))
+
+  # Record the supporting contrast names for each gene.
+  supporting <- vapply(
+    all_genes,
+    function(gene_id) paste(
+      names(contrast_lists)[vapply(
+        contrast_lists,
+        function(x) gene_id %in% x,
+        logical(1)
+      )],
+      collapse = "; "
+    ),
+    character(1)
+  )
+
+  # Return one reviewable row per gene.
+  data.frame(
+    Group = group_name,
+    gene = all_genes,
+    n_contrasts = as.integer(support_counts[[group_name]][all_genes]),
+    supporting_contrasts = supporting,
+    selected_for_GO = all_genes %in% go_gene_sets[[group_name]],
+    strict_intersection = all_genes %in% strict_gene_sets[[group_name]],
+    primary_comparison_supported = vapply(strsplit(supporting, "; ", fixed=TRUE), function(x) all(c("Dmel", "Dsan") %in% x), logical(1)),
+    stringsAsFactors = FALSE
+  )
+}
+
+# Combine the intersection audit tables for majority-supported, upregulated, and downregulated genes.
+intersection_table <- dplyr::bind_rows(lapply(
+  names(genes_by_group),
+  function(group_name) make_intersection_table(genes_by_group[[group_name]], group_name)
+)) %>%
+  dplyr::arrange(Group, dplyr::desc(n_contrasts), gene)
+
+# Export the full gene-level intersection audit table.
+safe_write_csv(
+  intersection_table,
+  file.path(go_output_dir, "three_groups_all_gene_intersections2.csv"),
+  row.names = FALSE
+)
+
+# Summarise relaxed and strict intersection sizes for immediate checking.
+intersection_summary <- data.frame(
+  Group = names(go_gene_sets),
+  selected_genes = lengths(go_gene_sets),
+  strict_all_contrast_genes = lengths(strict_gene_sets),
+  minimum_required_contrasts = min_overlap
+)
+
+# Display and export the three-group intersection summary.
+knitr::kable(intersection_summary, caption = "Cross-contrast gene groups used for GO")
+safe_write_csv(
+  intersection_summary,
+  file.path(go_output_dir, "three_groups_intersection_summary2.csv"),
+  row.names = FALSE
+)
+```
+
+---
+
+## Prepare Gene IDs for GO Enrichment
+
+```{r prepare_go_ids}
+# Build one annotation row for every gene tested by DESeq2.
+gene_table <- data.frame(gene = tested_genes, stringsAsFactors = FALSE) %>%
+  dplyr::mutate(
+    raw_id = gene,
+    symbol_guess = sub("_OG.*$", "", gene)
+  )
+
+# Map an identifier vector safely and return an empty table if mapping fails.
+safe_bitr <- function(ids, id_type) {
+  tryCatch(
+    suppressMessages(clusterProfiler::bitr(
+      unique(ids),
+      fromType = id_type,
+      toType = "ENTREZID",
+      OrgDb = org.Dm.eg.db
+    )),
+    error = function(e) data.frame()
+  )
+}
+
+# Map original genes to Entrez IDs using gene symbols first and FlyBase IDs second.
+map_to_entrez <- function(gene_ids) {
+  # Keep only annotation rows for the requested genes.
+  requested <- gene_table %>%
+    dplyr::filter(gene %in% unique(stats::na.omit(gene_ids)))
+
+  # Return a stable empty table when the input gene set is empty.
+  if (nrow(requested) == 0) {
+    return(tibble::tibble(
+      gene = character(),
+      raw_id = character(),
+      symbol_guess = character(),
+      ENTREZID = character()
+    ))
+  }
+
+  # Map the inferred symbol before the "_OG" suffix.
+  symbol_map <- safe_bitr(requested$symbol_guess, "SYMBOL")
+
+  # Map the complete identifier when it is already a FlyBase ID.
+  flybase_map <- safe_bitr(requested$raw_id, "FLYBASE")
+
+  # Join successful symbol mappings back to the original gene identifiers.
+  symbol_hits <- if (nrow(symbol_map) > 0) {
+    dplyr::inner_join(
+      requested,
+      symbol_map,
+      by = c("symbol_guess" = "SYMBOL")
+    )
+  } else {
+    tibble::tibble()
+  }
+
+  # Join successful FlyBase mappings back to the original gene identifiers.
+  flybase_hits <- if (nrow(flybase_map) > 0) {
+    dplyr::inner_join(
+      requested,
+      flybase_map,
+      by = c("raw_id" = "FLYBASE")
+    )
+  } else {
+    tibble::tibble()
+  }
+
+  # Combine both strategies and remove duplicated gene-to-Entrez mappings.
+  dplyr::bind_rows(symbol_hits, flybase_hits) %>%
+    dplyr::mutate(ENTREZID = as.character(ENTREZID)) %>%
+    dplyr::distinct(gene, ENTREZID, .keep_all = TRUE)
+}
+
+# Map every tested gene to create the correct enrichment background.
+universe_map <- map_to_entrez(tested_genes)
+
+# Map all three cross-contrast gene groups with the same function.
+group_maps <- lapply(go_gene_sets, map_to_entrez)
+
+# Summarise mapping performance because unmapped genes cannot contribute to GO.
+mapping_diagnostics <- dplyr::bind_rows(
+  data.frame(
+    Group = "background_universe",
+    input_genes = length(tested_genes),
+    mapped_genes = dplyr::n_distinct(universe_map$gene)
+  ),
+  dplyr::bind_rows(lapply(names(go_gene_sets), function(group_name) {
+    data.frame(
+      Group = group_name,
+      input_genes = length(go_gene_sets[[group_name]]),
+      mapped_genes = dplyr::n_distinct(group_maps[[group_name]]$gene)
+    )
+  }))
+) %>%
+  dplyr::mutate(mapping_rate = round(mapped_genes / pmax(input_genes, 1), 3))
+
+# Display and export the complete identifier-mapping diagnostics.
+knitr::kable(mapping_diagnostics, caption = "GO identifier-mapping diagnostics")
+safe_write_csv(
+  mapping_diagnostics,
+  file.path(go_output_dir, "GO_mapping_diagnostics2.csv"),
+  row.names = FALSE
+)
+
+# Create one Entrez-to-symbol lookup for readable GO gene lists.
+entrez_to_symbol <- AnnotationDbi::mapIds(
+  org.Dm.eg.db,
+  keys = unique(universe_map$ENTREZID),
+  column = "SYMBOL",
+  keytype = "ENTREZID",
+  multiVals = "first"
+)
+```
+
+---
+
+## Run GO Enrichment
+
+```{r go_enrichment}
+# Set the BH-adjusted p-value threshold used to call a GO term significant.
+go_fdr <- 0.05
+
+# Require enough mapped genes to avoid unstable enrichment tests.
+min_genes_for_go <- 10
+
+# Convert a slash-delimited Entrez list into readable gene symbols.
+collapse_gene_symbols <- function(entrez_string) {
+  # Split the clusterProfiler gene list into individual Entrez IDs.
+  entrez_ids <- strsplit(as.character(entrez_string), "/", fixed = TRUE)[[1]]
+
+  # Retrieve symbols from the lookup created once in the mapping section.
+  symbols <- unname(entrez_to_symbol[entrez_ids])
+
+  # Remove missing values and return one slash-delimited symbol list.
+  paste(unique(stats::na.omit(symbols)), collapse = "/")
+}
+
+# Build the Biological Process semantic-data object once and reuse it for every
+# group instead of recomputing information content inside each simplify() call.
+go_semdata <- GOSemSim::godata("org.Dm.eg.db", ont = "BP", computeIC = TRUE)
+
+term_counts <- list()
+# Run the same enrichment, annotation, and export steps for any mapped gene group.
+run_go <- function(gene_map, group_name) {
+  # Retain unique group and background identifiers.
+  gene_ids <- unique(gene_map$ENTREZID)
+  universe_ids <- unique(universe_map$ENTREZID)
+
+  # Skip groups that are too small after mapping.
+  if (length(gene_ids) < min_genes_for_go || length(universe_ids) == 0) {
+    term_counts[[group_name]] <<- c(before=0, after=0)
+    cat("Skipping GO for", group_name, "- mapped genes:", length(gene_ids), "\n")
+    return(data.frame())
+  }
+
+  # Test all eligible Biological Process terms using the tested-gene background.
+  ego <- suppressMessages(clusterProfiler::enrichGO(
+    gene = gene_ids,
+    universe = universe_ids,
+    OrgDb = org.Dm.eg.db,
+    keyType = "ENTREZID",
+    ont = "BP",
+    pAdjustMethod = "BH",
+    pvalueCutoff = 1,
+    qvalueCutoff = 1,
+    readable = FALSE
+  ))
+
+  # Convert the enrichment result into a normal data frame.
+  out <- as.data.frame(ego)
+  terms_before <- nrow(out)
+  if (terms_before == 0) { term_counts[[group_name]] <<- c(before=0, after=0); return(data.frame()) }
+  ego_sig <- ego
+  ego_sig@result <- ego@result %>% dplyr::filter(!is.na(p.adjust) & p.adjust <= go_fdr)
+  if (nrow(ego_sig@result) == 0) {
+    out_simplified <- data.frame()
+    terms_after <- 0L
+  } else {
+    ego_sim <- suppressMessages(enrichplot::pairwise_termsim(ego_sig))
+    ego_simplified <- suppressMessages(clusterProfiler::simplify(ego_sim, cutoff=0.7, by="p.adjust", select_fun=min, semData=go_semdata))
+    out_simplified <- as.data.frame(ego_simplified)
+    terms_after <- nrow(out_simplified)
+  }
+  term_counts[[group_name]] <<- c(before=terms_before, after=terms_after)
+  full_out <- out
+  full_out <- full_out %>% dplyr::mutate(Group=group_name, significant_BH=!is.na(p.adjust) & p.adjust <= go_fdr, geneSymbols=vapply(geneID, collapse_gene_symbols, character(1)))
+  out <- out_simplified
+
+  # Return a stable empty result when no ontology terms were testable.
+  if (nrow(out) == 0) return(data.frame())
+
+  # Add the biological group, significance flag, and readable gene symbols.
+  out <- out %>%
+    dplyr::mutate(
+      Group = group_name,
+      significant_BH = !is.na(p.adjust) & p.adjust <= go_fdr,
+      geneSymbols = vapply(geneID, collapse_gene_symbols, character(1))
+    ) %>%
+    dplyr::arrange(dplyr::desc(Count), p.adjust, Description)
+
+  # Export every tested term so non-significant results remain available for audit.
+  safe_write_csv(
+    full_out,
+    file.path(go_output_dir, paste0("GO_BP_", group_name, "_ALL_tested_terms2.csv")),
+    row.names = FALSE
+  )
+
+  # Export the simplified table used for summaries and figures.
+  safe_write_csv(out, file.path(go_output_dir, paste0("GO_BP_", group_name, "_SIMPLIFIED_terms2.csv")), row.names=FALSE)
+
+  # Export every significant term without applying an arbitrary top-N limit.
+  safe_write_csv(
+    dplyr::filter(out, significant_BH),
+    file.path(go_output_dir, paste0("GO_BP_", group_name, "_ALL_significant_terms2.csv")),
+    row.names = FALSE
+  )
+
+  # Return the complete table for summaries, detailed exports, and plotting.
+  out
+}
+
+# Run GO enrichment for the three groups with one reusable call.
+go_results <- lapply(
+  names(group_maps),
+  function(group_name) run_go(group_maps[[group_name]], group_name)
+)
+
+# Restore group names after lapply so later code is self-documenting.
+names(go_results) <- names(group_maps)
+
+# Combine every tested term from all non-empty group results.
+all_go_terms <- dplyr::bind_rows(go_results)
+
+# Keep every BH-significant term when enrichment returned results.
+significant_go_terms <- if (nrow(all_go_terms) > 0) {
+  dplyr::filter(all_go_terms, significant_BH)
+} else {
+  data.frame()
+}
+
+# Export one master table containing all tested terms from all three groups.
+safe_write_csv(
+  all_go_terms,
+  file.path(go_output_dir, "GO_BP_three_groups_ALL_tested_terms2.csv"),
+  row.names = FALSE
+)
+
+# Export one master table containing all significant terms from all three groups.
+safe_write_csv(
+  significant_go_terms,
+  file.path(go_output_dir, "GO_BP_three_groups_ALL_significant_terms2.csv"),
+  row.names = FALSE
+)
+
+# Build a concise group-level summary for interpretation and quality control.
+go_summary <- dplyr::bind_rows(lapply(names(go_gene_sets), function(group_name) {
+  data.frame(
+    Group = group_name,
+    input_genes = length(go_gene_sets[[group_name]]),
+    mapped_genes = dplyr::n_distinct(group_maps[[group_name]]$gene),
+    terms_before_simplification = unname(term_counts[[group_name]]["before"]),
+    terms_after_simplification = unname(term_counts[[group_name]]["after"]),
+    tested_GO_terms = nrow(go_results[[group_name]]),
+    significant_GO_terms = if (nrow(go_results[[group_name]]) > 0) {
+      sum(go_results[[group_name]]$significant_BH)
+    } else {
+      0
+    }
+  )
+}))
+
+# Display and export the GO analysis summary.
+knitr::kable(go_summary, caption = "GO enrichment summary for all three groups")
+safe_write_csv(
+  go_summary,
+  file.path(go_output_dir, "GO_BP_three_groups_summary2.csv"),
+  row.names = FALSE
+)
+```
+
+---
+
+## List Every Significant GO Term
+
+The table below includes every BH-significant term. The CSV exports also retain
+all tested non-significant terms for complete review.
+
+```{r all_go_terms_table}
+# Select the most useful review columns while retaining every significant row.
+go_review_table <- if (nrow(significant_go_terms) > 0) {
+  significant_go_terms %>%
+    dplyr::select(
+      Group,
+      ID,
+      Description,
+      GeneRatio,
+      BgRatio,
+      Count,
+      pvalue,
+      p.adjust,
+      qvalue,
+      geneSymbols
+    )
+} else {
+  data.frame(Note = "No GO terms passed the configured BH threshold.")
+}
+
+# Use a paginated table in HTML so long results remain searchable and readable.
+if (knitr::is_html_output()) {
+  rmarkdown::paged_table(go_review_table, options = list(rows.print = 20))
+} else {
+  knitr::kable(go_review_table, digits = 4)
+}
+```
+
+---
+
+## Export Every GO-Term-to-Gene Link
+
+```{r go_term_gene_details}
+# Expand one significant GO result into one row per contributing original gene.
+expand_go_genes <- function(go_table, mapped_genes, group_name) {
+  # Return an empty table when this group has no significant terms.
+  if (nrow(go_table) == 0 || !any(go_table$significant_BH)) return(data.frame())
+
+  # Keep all significant terms and expand their slash-delimited Entrez lists.
+  dplyr::bind_rows(lapply(
+    which(go_table$significant_BH),
+    function(i) {
+      # Split the current GO term into individual Entrez identifiers.
+      term_entrez <- strsplit(go_table$geneID[i], "/", fixed = TRUE)[[1]]
+
+      # Link each Entrez ID back to every matching original gene identifier.
+      mapped_genes %>%
+        dplyr::filter(ENTREZID %in% term_entrez) %>%
+        dplyr::distinct(gene, symbol_guess, ENTREZID) %>%
+        dplyr::mutate(
+          Group = group_name,
+          GO_ID = go_table$ID[i],
+          GO_Description = go_table$Description[i],
+          GO_p_adjust = go_table$p.adjust[i],
+          .before = 1
+        )
+    }
+  ))
+}
+
+# Expand every significant term from all three groups with the same helper.
+go_term_gene_details <- dplyr::bind_rows(lapply(
+  names(go_results),
+  function(group_name) expand_go_genes(
+    go_results[[group_name]],
+    group_maps[[group_name]],
+    group_name
+  )
+))
+
+# Sort the detailed table only when at least one term-to-gene link exists.
+if (nrow(go_term_gene_details) > 0) {
+  go_term_gene_details <- go_term_gene_details %>%
+    dplyr::arrange(Group, GO_p_adjust, GO_ID, gene)
+}
+
+# Export the complete GO-term-to-gene audit table.
+safe_write_csv(
+  go_term_gene_details,
+  file.path(go_output_dir, "GO_BP_ALL_significant_terms_with_ALL_genes2.csv"),
+  row.names = FALSE
+)
+
+# Display the detailed table in a paginated format when rows are available.
+if (nrow(go_term_gene_details) > 0 && knitr::is_html_output()) {
+  rmarkdown::paged_table(go_term_gene_details, options = list(rows.print = 20))
+} else if (nrow(go_term_gene_details) > 0) {
+  knitr::kable(go_term_gene_details, digits = 4)
+} else {
+  cat("No significant GO-term-to-gene links were available.\n")
+}
+```
+
+---
+
+## Visualise Every Significant GO Term
+
+Each bar represents one significant GO term. Bar height shows `Count`, the
+number of genes from the analysed group associated with that term. Terms run
+from largest to smallest from left to right. The plots are divided into pages
+of 15 terms so the 14-point x-axis labels remain readable.
+
+```{r go_plots, fig.width=18, fig.height=10}
+# Create paginated bar charts ordered by descending GO-term gene count.
+plot_go_bars <- function(go_table, group_label, terms_per_page = 15) {
+  # Stop cleanly when enrichment did not return a result table.
+  if (is.null(go_table) || nrow(go_table) == 0) {
+    cat("No GO results for", group_label, "\n")
+    return(invisible(NULL))
+  }
+
+  # Retain every significant term and rank terms from largest to smallest.
+  significant_terms <- go_table %>%
+    dplyr::filter(significant_BH) %>%
+    dplyr::arrange(dplyr::desc(Count), p.adjust, Description)
+
+  # Stop cleanly when no term passes the selected BH threshold.
+  if (nrow(significant_terms) == 0) {
+    cat("No significant GO terms for", group_label, "\n")
+    return(invisible(NULL))
+  }
+
+  # Store the descending size rank used to paginate the complete term list.
+  significant_terms$Size_rank <- seq_len(nrow(significant_terms))
+
+  # Divide the ordered terms into readable pages without dropping any term.
+  page_ids <- ceiling(significant_terms$Size_rank / terms_per_page)
+
+  # Build one bar chart for each consecutive size-ranked page.
+  for (page_id in unique(page_ids)) {
+    # Select the next group of largest remaining GO terms.
+    page_terms <- significant_terms[page_ids == page_id, , drop = FALSE]
+
+    # Wrap long term names while preserving the descending left-to-right order.
+    page_terms$Term <- paste0(
+      page_terms$ID,
+      "\n",
+      stringr::str_wrap(page_terms$Description, width = 24)
+    )
+    page_terms$Term <- factor(page_terms$Term, levels = page_terms$Term)
+
+    # Convert adjusted p-values to a clear positive colour scale.
+    page_terms$MinusLog10FDR <- -log10(
+      pmax(page_terms$p.adjust, .Machine$double.xmin)
+    )
+
+    # Draw the bar chart with GO terms on the x-axis and gene count on the y-axis.
+    bar_plot <- ggplot2::ggplot(
+      page_terms,
+      ggplot2::aes(x = Term, y = Count, fill = MinusLog10FDR)
+    ) +
+      ggplot2::geom_col(width = 0.78) +
+      ggplot2::geom_text(
+        ggplot2::aes(label = Count),
+        vjust = -0.35,
+        size = 4.5
+      ) +
+      ggplot2::scale_fill_gradient(low = "#BFD3E6", high = "#084594") +
+      ggplot2::scale_y_continuous(
+        expand = ggplot2::expansion(mult = c(0, 0.12))
+      ) +
+      ggplot2::theme_minimal(base_size = 14) +
+      ggplot2::theme(
+        panel.grid.major.x = ggplot2::element_blank(),
+        panel.grid.minor = ggplot2::element_blank(),
+        axis.text.x = ggplot2::element_text(
+          size = 14,
+          angle = 60,
+          hjust = 1,
+          vjust = 1
+        ),
+        axis.text.y = ggplot2::element_text(size = 14),
+        axis.title = ggplot2::element_text(size = 16),
+        plot.title = ggplot2::element_text(size = 18, face = "bold"),
+        plot.subtitle = ggplot2::element_text(size = 14),
+        legend.title = ggplot2::element_text(size = 14),
+        legend.text = ggplot2::element_text(size = 13)
+      ) +
+      ggplot2::labs(
+        title = paste("GO Biological Process enrichment:", group_label),
+        subtitle = paste0(
+          "Page ", page_id, " of ", max(page_ids),
+          "; size ranks ", min(page_terms$Size_rank),
+          "\u2013", max(page_terms$Size_rank),
+          " (largest to smallest by gene count)"
+        ),
+        x = "GO term",
+        y = "Gene count",
+        fill = expression(-log[10]("BH adjusted p-value"))
+      )
+
+    # Print the current bar-chart page into the knitted report.
+    print(bar_plot)
+  }
+}
+
+# Plot all significant majority-supported DE GO terms as size-ranked bar charts.
+plot_go_bars(go_results$majority_supported_DE, "majority-supported DE genes")
+
+# Plot all terms from genes repeatedly higher in D. erecta.
+plot_go_bars(
+  go_results$upregulated_in_Dere,
+  "upregulated in D. erecta"
+)
+
+# Plot all terms from genes repeatedly lower in D. erecta.
+plot_go_bars(
+  go_results$downregulated_in_Dere,
+  "downregulated in D. erecta"
+)
+```
+
+
+## Reproducibility
+<details><summary>Session information</summary>
+
+```{r session_info}
+sessionInfo()
+```
+
+</details>

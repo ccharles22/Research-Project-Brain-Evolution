@@ -1,0 +1,285 @@
+---
+title: "05. Independent FlyBase Functional-Group Relative-Rate Analysis: ERE vs MEL vs SUZ"
+author: "Candice Charles"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+params:
+  tpm_file: "D:/Bioinformatics/treeexp_LA_TPM_gt1_all_species.txt"
+  candidate_dir: "D:/Bioinformatics"
+  comparison: "MEL"
+  output_dir: "."
+  null_repeats: 1000
+  logo_top_fraction: 0.05
+  min_group_size: 3
+  seed: 1
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+# Load packages, set reproducible options, and create the output folder.
+needed <- c("TreeExp", "dplyr", "ggplot2", "tibble", "knitr", "AnnotationDbi", "org.Dm.eg.db")
+missing <- needed[!vapply(needed, requireNamespace, logical(1), quietly=TRUE)]
+if(length(missing)) stop("Install required packages: ",paste(missing,collapse=", "))
+for(p in needed) suppressPackageStartupMessages(library(p,character.only=TRUE))
+dir.create(params$output_dir,recursive=TRUE,showWarnings=FALSE); set.seed(params$seed)
+resolve <- function(x) if(grepl("^[A-Za-z]:|^/",x)) x else file.path(getwd(),x)
+tpm_path <- resolve(params$tpm_file); candidate_path <- resolve(params$candidate_dir); comparison_taxon <- params$comparison
+if(!file.exists(tpm_path)) stop("Missing TPM file: ",tpm_path)
+if(!dir.exists(candidate_path)) stop("Missing candidate-set folder: ",candidate_path)
+```
+
+## Load and prepare the TPM matrix
+
+```{r load_expression}
+# Read the TPM matrix, prepare the TreeExp table, and keep the three required taxa.
+taxa_objects <- TreeExp::TEconstruct(ExpValueFP=tpm_path,taxa="all",subtaxa="all")
+exp_table <- TreeExp::exptabTE(objects=taxa_objects,taxa="all",subtaxa="LA"); colnames(exp_table) <- sub("_LA$","",colnames(exp_table))
+required_taxa <- c("ERE",comparison_taxon,"SUZ"); if(!all(required_taxa %in% colnames(exp_table))) stop("Missing taxa: ",paste(setdiff(required_taxa,colnames(exp_table)),collapse=", "))
+expr <- as.matrix(exp_table[,required_taxa,drop=FALSE]); if(any(!is.finite(expr))) stop("Expression table contains non-finite values")
+```
+
+## Define the independent FlyBase groups
+
+```{r define_groups}
+# Discover every candidate membership text file at knit time so new categories are picked up automatically.
+all_txt <- list.files(candidate_path, pattern = "\\.txt$", full.names = TRUE, ignore.case = TRUE)
+# Exclude expression matrices and the explicitly excluded neuropeptide list from the candidate-set folder.
+excluded_names <- c(basename(tpm_path), "File_S3_spp_tpm_1to1s.txt", "treeexp_LA_TPM_gt1_all_species.txt", "FlyBase_Fields_download (Neuropeptides).txt", "Cellular Respiration.txt", "Metabolic Processes.txt", "Molting Cycle Process.txt")
+group_paths <- all_txt[!basename(all_txt) %in% excluded_names]
+if (!length(group_paths)) stop("No candidate membership .txt files found in: ", candidate_path)
+# Derive readable, traceable group names directly from each source filename.
+clean_group_name <- function(path) {
+  name <- tools::file_path_sans_ext(basename(path))
+  name <- gsub("[_]+", " ", name)
+  name <- gsub("\\s+", " ", trimws(name))
+  name
+}
+group_files <- setNames(group_paths, vapply(group_paths, clean_group_name, character(1)))
+if (anyDuplicated(names(group_files))) names(group_files) <- make.unique(names(group_files), sep = " ")
+source_files <- data.frame(group = names(group_files), source_file = unname(group_files), stringsAsFactors = FALSE)
+knitr::kable(source_files, caption = "Candidate membership files loaded")
+```
+
+```{r read_membership}
+# Read FlyBase IDs and symbols from either a GO TSV or a downloaded FlyBase table.
+read_membership <- function(path){
+  # Read structured FlyBase exports when headers identify FB IDs and symbols.
+  x <- tryCatch(read.delim(path,header=TRUE,check.names=FALSE,stringsAsFactors=FALSE,quote="",fill=TRUE),error=function(e) data.frame())
+  if(nrow(x) && "FBID_KEY" %in% names(x)) {
+    ids <- trimws(as.character(x$FBID_KEY))
+    symbols <- if("SYMBOL" %in% names(x)) trimws(as.character(x$SYMBOL)) else if("ANNOTATION_SYMBOL" %in% names(x)) trimws(as.character(x$ANNOTATION_SYMBOL)) else rep(NA_character_,length(ids))
+  } else {
+    # Read simple one-ID-per-line files, such as the nervous-system list.
+    ids <- trimws(readLines(path,warn=FALSE))
+    symbols <- rep(NA_character_,length(ids))
+  }
+  out <- data.frame(FBgn=ids,SYMBOL=symbols,stringsAsFactors=FALSE) %>% filter(grepl("^FBgn",FBgn)) %>% distinct(FBgn,.keep_all=TRUE)
+  # Resolve ID-only lists to symbols through the FlyBase annotation database.
+  if(nrow(out) && all(is.na(out$SYMBOL))) {
+    mapped <- AnnotationDbi::select(org.Dm.eg.db, keys=out$FBgn, keytype="FLYBASE", columns="SYMBOL") %>% distinct(FLYBASE,.keep_all=TRUE)
+    out$SYMBOL <- mapped$SYMBOL[match(out$FBgn,mapped$FLYBASE)]
+  }
+  out
+}
+# Match FlyBase symbols to the orthogroup-tagged expression identifiers.
+tpm_symbols <- sub("_OG.*$","",rownames(expr))
+map_group <- function(group,path){
+ m <- read_membership(path); matched <- unique(rownames(expr)[tpm_symbols %in% unique(m$SYMBOL)])
+ failed <- m$FBgn[!(m$SYMBOL %in% tpm_symbols)]
+ list(group=group,source_file=path,source=m,matched=matched,failed=unique(failed))
+}
+group_maps <- lapply(names(group_files),function(g) map_group(g,group_files[[g]])); names(group_maps) <- names(group_files)
+```
+
+```{r mapping_summary}
+# Report source IDs, matched genes, failed IDs, and mapping rates for every group.
+mapping_summary <- bind_rows(lapply(group_maps,function(z) data.frame(group=z$group,source_file=basename(z$source_file),source_ids=nrow(z$source),matched_genes=length(z$matched),failed_ids=length(z$failed),mapping_rate=length(unique(z$matched))/max(1,nrow(z$source)),mapping_attention=length(unique(z$matched))/max(1,nrow(z$source)) < 0.5,transcriptome_fraction=length(z$matched)/max(1,nrow(expr)),large_category_flag=length(z$matched)/max(1,nrow(expr)) >= 0.5)))
+failed_mapping <- bind_rows(lapply(group_maps,function(z) if(length(z$failed)) data.frame(group=z$group,source_file=basename(z$source_file),FBgn=z$failed,stringsAsFactors=FALSE) else data.frame(group=character(),source_file=character(),FBgn=character(),stringsAsFactors=FALSE)))
+write.csv(mapping_summary,file.path(params$output_dir,"05_independent_group_mapping_summary.csv"),row.names=FALSE); write.csv(failed_mapping,file.path(params$output_dir,"05_independent_group_failed_FlyBase_IDs.csv"),row.names=FALSE)
+knitr::kable(mapping_summary,digits=3,caption="Independent FlyBase group mapping summary")
+knitr::kable(utils::head(failed_mapping,100),caption="First 100 failed FlyBase IDs")
+large_categories <- mapping_summary %>% dplyr::filter(large_category_flag)
+if (nrow(large_categories)) knitr::kable(large_categories, digits=3, caption="Categories covering at least half of the filtered transcriptome") else cat("No category covers at least half of the filtered transcriptome.\n")
+```
+
+## Whole-transcriptome baseline
+
+```{r baseline}
+# Calculate the whole-transcriptome reference for ERE versus the requested comparator with SUZ as outgroup.
+delta <- function(x) { d <- TreeExp::dist.sou(x); as.numeric(d["SUZ", "ERE"] - d["SUZ", comparison_taxon]) }
+full_test <- TreeExp::RelaRate.test(expTable = expr, x = "ERE", y = comparison_taxon, outgroup = "SUZ", alternative = "greater")
+full_dist <- TreeExp::dist.sou(expr)
+full_z <- as.numeric(full_test[[1]])
+full_p <- as.numeric(full_test[[3]])
+expected_z <- c(MEL = 2.91, SAN = 4.89)[[comparison_taxon]]
+if (is.finite(expected_z) && abs(full_z - expected_z) > 0.2) warning("Whole-transcriptome baseline Z differs from the expected Script 04 value: ", expected_z)
+baseline <- data.frame(group = "Whole transcriptome", group_type = "Reference", source_file = NA_character_, n_genes = nrow(expr), ERE_to_SUZ = full_dist["SUZ", "ERE"], comparator_to_SUZ = full_dist["SUZ", comparison_taxon], delta = delta(expr), z_score = full_z, analytical_p = full_p, empirical_p = NA_real_, status = "reference", stringsAsFactors = FALSE)
+write.csv(baseline, file.path(params$output_dir, paste0(params$comparison, "_whole_transcriptome_baseline.csv")), row.names = FALSE)
+knitr::kable(baseline, digits = 5, caption = paste("Whole-transcriptome ERE versus", comparison_taxon, "baseline"))
+```
+
+```{r group_tests}
+# Test each matched group with the prespecified one-sided ERE-greater-than-comparator alternative and a matched-size empirical null.
+run_group <- function(z) {
+  ids <- unique(z$matched); n <- length(ids)
+  base <- data.frame(group = z$group, group_type = "FlyBase category", source_file = basename(z$source_file), n_genes = n, ERE_to_SUZ = NA_real_, comparator_to_SUZ = NA_real_, delta = NA_real_, z_score = NA_real_, analytical_p = NA_real_, empirical_p = NA_real_, status = "skipped", stringsAsFactors = FALSE)
+  if (n < params$min_group_size) { base$status <- "below_min_group_size"; return(base) }
+  test <- tryCatch(TreeExp::RelaRate.test(expTable = expr[ids, , drop = FALSE], x = "ERE", y = comparison_taxon, outgroup = "SUZ", alternative = "greater"), error = function(e) NULL)
+  if (is.null(test)) { base$status <- "TreeExp_failed"; return(base) }
+  d <- TreeExp::dist.sou(expr[ids, , drop = FALSE]); observed <- as.numeric(d["SUZ", "ERE"] - d["SUZ", comparison_taxon])
+  null_delta <- replicate(params$null_repeats, delta(expr[sample(rownames(expr), n), , drop = FALSE]))
+  base$ERE_to_SUZ <- as.numeric(d["SUZ", "ERE"]); base$comparator_to_SUZ <- as.numeric(d["SUZ", comparison_taxon]); base$delta <- observed; base$z_score <- as.numeric(test[[1]]); base$analytical_p <- as.numeric(test[[3]]); base$empirical_p <- (1 + sum(null_delta >= observed, na.rm = TRUE)) / (1 + sum(is.finite(null_delta))); base$status <- "tested"; base
+}
+# Run all independent categories and correct analytical and empirical p-values separately within this report.
+group_results <- dplyr::bind_rows(lapply(group_maps, run_group))
+group_results$analytical_fdr <- p.adjust(ifelse(is.na(group_results$analytical_p), 1, group_results$analytical_p), "BH")
+group_results$empirical_fdr <- p.adjust(ifelse(is.na(group_results$empirical_p), 1, group_results$empirical_p), "BH")
+all_results <- dplyr::bind_rows(baseline, group_results)
+write.csv(group_results, file.path(params$output_dir, paste0(params$comparison, "_independent_group_relative_rate_results.csv")), row.names = FALSE)
+knitr::kable(group_results, digits = 5, caption = paste("Independent FlyBase category tests: ERE versus", comparison_taxon))
+```
+
+## Compare all group Z-scores
+
+```{r zscore_plot, fig.width=14, fig.height=10}
+plot_data <- all_results %>%
+  filter(is.finite(z_score)) %>%
+  mutate(
+    label_text = paste0(
+      stringr::str_wrap(group, width = 34),
+      "\n[n=", n_genes, "]"
+    ),
+    label = factor(
+      label_text,
+      levels = rev(unique(label_text))
+    ),
+    z_label = sprintf("Z = %.2f", z_score)
+  )
+
+# Use one fixed position for the Z-score labels so they cannot overlap
+# the category names on the left.
+z_label_x <- max(c(0, plot_data$z_score), na.rm = TRUE) + 0.35
+
+p_z <- ggplot(plot_data, aes(x = z_score, y = label, fill = group_type)) +
+  geom_col(width = 0.65) +
+  geom_text(
+    aes(x = z_label_x, label = z_label),
+    hjust = 0,
+    size = 4.8,
+    fontface = "bold"
+  ) +
+  geom_vline(
+    xintercept = 0,
+    linetype = "dashed",
+    linewidth = 0.8
+  ) +
+  scale_x_continuous(
+    expand = expansion(mult = c(0.08, 0.28))
+  ) +
+  labs(
+    title = "ERE relative-rate Z-scores",
+    subtitle = "ERE is compared with MEL; SUZ is the outgroup.",
+    x = "Z-score",
+    y = NULL,
+    fill = "Group type"
+  ) +
+  theme_minimal(base_size = 16) +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(
+      size = 22,
+      face = "bold",
+      margin = margin(b = 6)
+    ),
+    plot.subtitle = element_text(
+      size = 17,
+      face = "bold",
+      margin = margin(b = 14)
+    ),
+    axis.title.x = element_text(
+      size = 17,
+      face = "bold",
+      margin = margin(t = 10)
+    ),
+    axis.text.x = element_text(
+      size = 14,
+      face = "bold"
+    ),
+    axis.text.y = element_text(
+      size = 14,
+      face = "bold",
+      lineheight = 0.95,
+      margin = margin(r = 14)
+    ),
+    legend.position = "bottom",
+    legend.direction = "horizontal",
+    legend.title = element_text(
+      size = 15,
+      face = "bold"
+    ),
+    legend.text = element_text(
+      size = 14,
+      face = "bold"
+    ),
+    plot.margin = margin(15, 45, 15, 15)
+  )
+
+print(p_z)
+
+ggsave(
+  file.path(params$output_dir, "05_independent_group_zscores.png"),
+  p_z,
+  width = 14,
+  height = 10,
+  dpi = 300
+)
+
+knitr::include_graphics(
+  file.path(params$output_dir, "05_independent_group_zscores.png")
+)
+```
+
+## Leave-one-gene-out analysis
+
+```{r logo}
+# Remove each gene once and record how much it changes the group's distance contrast.
+logo_one_group <- function(z){ ids <- unique(z$matched); n <- length(ids); if(n < params$min_group_size) return(data.frame()); full <- delta(expr[ids,,drop=FALSE]); bind_rows(lapply(ids,function(g){keep <- setdiff(ids,g); loo <- delta(expr[keep,,drop=FALSE]); data.frame(group=z$group,group_type=if(grepl("^GO_",z$group)) "GO term" else "FlyBase set",source_file=basename(z$source_file),gene_id=g,group_size=n,full_delta=full,loo_delta=loo,logo_influence=full-loo,positive=(full-loo)>0,stringsAsFactors=FALSE)})) %>% group_by(group) %>% mutate(rank=rank(-logo_influence,ties.method="first"),rank_fraction=rank/group_size) %>% ungroup() }
+logo <- bind_rows(lapply(group_maps,logo_one_group)); write.csv(logo,file.path(params$output_dir,"05_independent_group_LOGO_rankings.csv"),row.names=FALSE); knitr::kable(utils::head(logo,100),digits=4,caption="Leave-one-gene-out influence results")
+```
+
+```{r recurring}
+# Summarise genes that are positive top contributors in at least two groups.
+recurring <- logo %>% filter(positive,rank_fraction<=params$logo_top_fraction) %>% group_by(gene_id) %>% summarise(n_groups=n_distinct(group),groups=paste(sort(unique(group)),collapse="; "),best_rank_fraction=min(rank_fraction),mean_influence=mean(logo_influence),max_influence=max(logo_influence),.groups="drop") %>% filter(n_groups>=2) %>% mutate(SYMBOL=sub("_OG.*$","",gene_id)) %>% arrange(desc(n_groups),best_rank_fraction,desc(mean_influence))
+write.csv(recurring,file.path(params$output_dir,"05_independent_recurring_positive_driver_genes.csv"),row.names=FALSE); knitr::kable(recurring,digits=4,caption="Recurring positive contributors")
+```
+
+```{r recurring_plot, fig.width=10, fig.height=7}
+# Render the recurring-contributor bar chart when at least one gene recurs.
+if(nrow(recurring)){ plot_recurring <- recurring %>% slice_head(n=25) %>% mutate(plot_label=make.unique(as.character(SYMBOL))) %>% mutate(plot_label=factor(plot_label,levels=rev(plot_label))); p_rec <- ggplot(plot_recurring,aes(plot_label,n_groups))+geom_col(fill="#0072B2")+coord_flip()+theme_minimal(base_size=11)+labs(title="Recurring positive contributors",x=NULL,y="Number of groups"); print(p_rec); ggsave(file.path(params$output_dir,"05_independent_recurring_driver_gene_counts.png"),p_rec,width=10,height=7,dpi=300); knitr::include_graphics(file.path(params$output_dir,"05_independent_recurring_driver_gene_counts.png")) } else cat("No gene was a positive top contributor in at least two groups.
+")
+```
+
+## Reproducibility
+
+```{r reproducibility}
+# Save the analysis settings and display the session information.
+parameters <- data.frame(parameter=c("null_repeats","min_group_size","logo_top_fraction","seed"),value=c(params$null_repeats,params$min_group_size,params$logo_top_fraction,params$seed)); write.csv(parameters,file.path(params$output_dir,"05_independent_analysis_parameters.csv"),row.names=FALSE); knitr::kable(parameters); sessionInfo()
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,185 @@
+---
+title: "01. DESeq2 Pairwise Differential Expression - D. simulans"
+author: "Candice Charles"
+date: "2026-08-12"
+params:
+  count_dir: "D:/Bioinformatics"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+# Set report options and load the packages used in this analysis.
+knitr::opts_chunk$set(echo=TRUE, warning=FALSE, message=FALSE)
+required_packages <- c("DESeq2","readxl","dplyr","ggplot2","pheatmap","tibble","readr")
+missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly=TRUE)]
+if(length(missing_packages)) stop("Missing packages: ",paste(missing_packages,collapse=", "))
+suppressPackageStartupMessages({library(DESeq2);library(readxl);library(dplyr);library(ggplot2);library(pheatmap);library(tibble);library(readr)})
+if(!requireNamespace("apeglm", quietly=TRUE)) stop("Package apeglm is required for lfcShrink(type='apeglm'). Install it before knitting.")
+safe_write_csv <- function(x,file,row.names=FALSE) utils::write.csv(x,file,row.names=row.names)
+```
+
+## Define file paths
+
+```{r file_paths}
+# Build paths to the six raw count workbooks.
+files <- file.path(params$count_dir,paste0(c("Dere","Dmel","Dsuz","Dsim","Dsec","Dsan"),"_counts.xlsx")); names(files) <- c("Dere","Dmel","Dsuz","Dsim","Dsec","Dsan")
+missing <- files[!file.exists(files)]; if(length(missing)) stop("Missing raw count workbook(s): ",paste(normalizePath(missing,winslash="/",mustWork=FALSE),collapse=", "),". Set count_dir to their folder.")
+```
+
+## Import and merge counts
+
+```{r import_function}
+# Read one workbook, remove blank genes, keep a valid duplicate, and drop remaining missing values.
+read_species_counts <- function(file){
+ df <- read_excel(file,sheet=1,na=c("","NA")); if(!"DmelID" %in% names(df)) stop("Count file lacks DmelID: ",file)
+ cc <- setdiff(names(df),c("DmelID",grep("_gene_name$",names(df),value=TRUE))); if(length(cc)!=3L) stop("Expected three replicate columns in ",file)
+ df[cc] <- lapply(df[cc],function(x)suppressWarnings(as.numeric(x)))
+ nonempty <- !is.na(df$DmelID)&trimws(as.character(df$DmelID))!=""; has_data <- apply(df[cc],1,function(x)any(!is.na(x)&x!=0)); df <- df[nonempty&has_data,c("DmelID",cc),drop=FALSE]
+ df <- df[!duplicated(df$DmelID),,drop=FALSE]; df[complete.cases(df[,cc,drop=FALSE]),,drop=FALSE]
+}
+```
+
+```{r import_data}
+# Read every species table and map each sample column to its species.
+count_list <- lapply(files,read_species_counts); column_to_species <- list()
+for(i in seq_along(count_list)) for(col in setdiff(names(count_list[[i]]),"DmelID")) column_to_species[[col]] <- names(files)[i]
+merged_counts <- Reduce(function(x,y)full_join(x,y,by="DmelID"),count_list); merged_counts <- merged_counts[complete.cases(merged_counts),,drop=FALSE]
+count_matrix <- as.data.frame(merged_counts); rownames(count_matrix) <- count_matrix$DmelID; count_matrix$DmelID <- NULL; count_matrix[] <- lapply(count_matrix,function(x)as.integer(round(x)))
+```
+
+```{r metadata}
+# Create sample metadata and use Dsim as the reference species.
+sample_info <- data.frame(sample=colnames(count_matrix),species=sapply(colnames(count_matrix),function(x)column_to_species[[x]]),row.names=colnames(count_matrix)); sample_info$species <- relevel(factor(sample_info$species),ref="Dsim"); stopifnot(identical(rownames(sample_info),colnames(count_matrix)))
+```
+
+## Run DESeq2
+
+```{r deseq2}
+# Build the model, apply the group-aware count filter, and fit DESeq2.
+dds <- DESeqDataSetFromMatrix(countData=count_matrix,colData=sample_info,design=~species); smallestGroupSize <- min(table(sample_info$species)); dds <- dds[rowSums(counts(dds)>=10)>=smallestGroupSize,]; dds <- DESeq(dds)
+safe_write_csv(as.data.frame(counts(dds,normalized=TRUE)),"normalized_counts_all_species2.csv",row.names=TRUE); vsd_mat <- assay(vst(dds,blind=FALSE)); qc_vsd <- vst(estimateSizeFactors(dds),blind=TRUE)
+```
+
+```{r pca}
+# Plot variance-stabilised samples coloured by species.
+print(plotPCA(qc_vsd,intgroup="species"))
+```
+
+## Pairwise comparisons
+
+```{r pairwise_results}
+# Test every other species against Dsim using threshold-aware p-values and shrunken effects.
+comparison_species <- setdiff(levels(sample_info$species),"Dsim"); padj_cutoff <- 0.10; strict_padj_cutoff <- 0.05; lfc_cutoff <- 0.5; strict_lfc_cutoff <- 1
+results_list <- list(); tested_genes_by_contrast <- list(); summary_table <- list()
+for(sp in comparison_species){
+ coef_name <- grep(paste0("^species_",sp,"_vs_Dsim$"),resultsNames(dds),value=TRUE)
+ if(length(coef_name) != 1L) stop("Expected exactly one coefficient matching ",sp," vs the reference level; found ",length(coef_name),". apeglm requires `coef`, so the focal species must be the reference level (check the relevel() call).")
+ raw_mle <- results(dds,name=coef_name,alpha=padj_cutoff)
+ raw <- results(dds,name=coef_name,alpha=padj_cutoff,lfcThreshold=lfc_cutoff,altHypothesis="greaterAbs")
+ strict <- results(dds,name=coef_name,alpha=strict_padj_cutoff,lfcThreshold=strict_lfc_cutoff,altHypothesis="greaterAbs")
+ shr <- lfcShrink(dds,coef=coef_name,res=raw_mle,type="apeglm")
+ df <- as.data.frame(raw) %>% rownames_to_column("gene") %>% rename(threshold_log2FoldChange=log2FoldChange, threshold_pvalue=pvalue)
+ df$raw_log2FoldChange <- as.data.frame(raw_mle)$log2FoldChange; df$raw_pvalue <- as.data.frame(raw_mle)$pvalue; df$raw_padj <- as.data.frame(raw_mle)$padj
+ df$log2FoldChange <- as.data.frame(shr)$log2FoldChange; df$strict_padj <- as.data.frame(strict)$padj
+ df <- df %>% mutate(significant=!is.na(padj)&padj<padj_cutoff, significant_strict=!is.na(strict_padj)&strict_padj<strict_padj_cutoff, higher_in_Dsim=significant&log2FoldChange<0, lower_in_Dsim=significant&log2FoldChange>0)
+ results_list[[sp]] <- df; tested_genes_by_contrast[[sp]] <- df$gene[!is.na(df$threshold_pvalue)]; safe_write_csv(df,paste0("DESeq2_",sp,"_vs_Dsim.csv"))
+ summary_table[[sp]] <- data.frame(comparison=paste0(sp,"_vs_Dsim"),genes_tested=sum(!is.na(df$threshold_pvalue)),significant_genes=sum(df$significant,na.rm=TRUE),significant_genes_strict=sum(df$significant_strict,na.rm=TRUE),higher_in_Dsim=sum(df$higher_in_Dsim,na.rm=TRUE),lower_in_Dsim=sum(df$lower_in_Dsim,na.rm=TRUE))
+}
+contrast_summary <- bind_rows(summary_table); stopifnot(all(contrast_summary$significant_genes == contrast_summary$higher_in_Dsim + contrast_summary$lower_in_Dsim)); zero_shrunken_by_contrast <- bind_rows(lapply(names(results_list), function(sp) data.frame(comparison=paste0(sp,"_vs_Dsim"),significant_shrunken_log2FC_exactly_zero=sum(results_list[[sp]]$significant & results_list[[sp]]$log2FoldChange == 0,na.rm=TRUE)))); zero_shrunken_by_contrast; safe_write_csv(contrast_summary,"DESeq2_contrast_summary_and_sensitivity.csv"); contrast_summary
+```
+
+```{r volcano_plots}
+# Full scientific names used in plot labels.
+species_names <- c(
+  Dere = "D. erecta",
+  Dmel = "D. melanogaster",
+  Dsim = "D. simulans",
+  Dsec = "D. sechellia",
+  Dsan = "D. santomea",
+  Dsuz = "D. suzukii"
+)
+
+# Set these three values according to the script's reference species.
+reference_code <- "Dsim"
+reference_label <- species_names[[reference_code]]
+higher_reference_column <- "higher_in_Dsim"
+lower_reference_column <- "lower_in_Dsim"
+
+plot_volcano <- function(x, sp) {
+
+  comparison_label <- species_names[[sp]]
+
+  d <- x %>%
+    mutate(
+      y = -log10(pmax(padj, 1e-300)),
+      status = case_when(
+        .data[[higher_reference_column]] ~
+          paste("Higher in", reference_label),
+        .data[[lower_reference_column]] ~
+          paste("Higher in", comparison_label),
+        TRUE ~ "Not significant"
+      )
+    )
+
+  plot_title <- bquote(
+    italic(.(reference_label)) ~ "vs" ~ italic(.(comparison_label))
+  )
+
+  ggplot(d, aes(log2FoldChange, y, colour = status)) +
+    geom_point(alpha = 0.80, size = 2.5) +
+    geom_vline(
+      xintercept = c(-lfc_cutoff, lfc_cutoff),
+      linetype = "dashed",
+      colour = "grey40"
+    ) +
+    geom_hline(
+      yintercept = -log10(padj_cutoff),
+      linetype = "dashed",
+      colour = "red4"
+    ) +
+    theme_minimal(base_size = 16) +
+    labs(
+      title = plot_title,
+      x = "Shrunken log2 fold change",
+      y = "-log10 adjusted p-value",
+      colour = NULL
+    ) +
+    theme(
+      plot.title = element_text(size = 16),
+      axis.title = element_text(size = 16),
+      axis.text = element_text(size = 14),
+      legend.text = element_text(size = 16)
+    ) +
+    guides(colour = guide_legend(override.aes = list(size = 3)))
+}
+
+for (sp in comparison_species) {
+  print(plot_volcano(results_list[[sp]], sp))
+}
+```
+
+```{r heatmaps}
+# Draw a heatmap from the top 75 significant genes in each contrast.
+for(sp in comparison_species){ top <- results_list[[sp]] %>% filter(significant) %>% arrange(padj,desc(abs(log2FoldChange))) %>% slice_head(n=75) %>% pull(gene); if(length(top)<2) next; ks <- rownames(sample_info)[sample_info$species %in% c("Dsim",sp)]; hm <- vsd_mat[top,ks,drop=FALSE]; hm <- hm[apply(hm,1,sd)>0,,drop=FALSE]; if(nrow(hm)<2) next; pheatmap(t(scale(t(hm))),annotation_col=sample_info[ks,"species",drop=FALSE],fontsize_row=6,main=paste("Top 75 genes:",sp,"vs Dsim")) }
+```
+
+## Save handoff for GO enrichment
+
+```{r save_go_handoff}
+# Save results, tested genes, and thresholds for script 02.
+go_input_objects <- list(results_list=results_list,comparison_species=comparison_species,tested_genes_by_contrast=tested_genes_by_contrast,padj_cutoff=padj_cutoff,lfc_cutoff=lfc_cutoff); saveRDS(go_input_objects,"deseq2_GO_input_objects.rds")
+```
+
+```{r session_info}
+# Record software versions used to make the report.
+sessionInfo()
+```
+
+
+
+
+

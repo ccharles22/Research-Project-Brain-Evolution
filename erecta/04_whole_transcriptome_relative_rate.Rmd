@@ -1,0 +1,217 @@
+---
+title: "LA Relative Rate Tests for Erecta"
+author: "Candice Charles"
+date: "`r Sys.Date()`"
+params:
+  input_la_tpm_file: "treeexp_LA_TPM_gt1_all_species.txt"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+    number_sections: true
+    mathjax: null
+---
+
+## Aim and statistical framework
+
+This analysis tests whether the *D. erecta* transcriptome differs in relative-rate divergence from SEC, MEL, SAN, and SIM, using SUZ as the outgroup. Testing the complete filtered transcriptome is a deliberate extension of the smaller, biologically predefined gene-set case study described in the TreeExp tutorial. Every relative-rate result assumes SUZ is an unbiased, neutral outgroup. If the SUZ lineage has experienced accelerated expression evolution, all ERE-versus-comparator Z-scores could be biased in a shared direction (an expression-evolution analogue of long-branch attraction); where the dataset permits, this should be checked by rerunning the analysis with an alternative outgroup.
+
+```{r setup}
+needed <- c("TreeExp", "ggplot2")
+missing <- needed[!vapply(needed, requireNamespace, logical(1), quietly=TRUE)]
+if (length(missing)) stop("Missing packages: ", paste(missing, collapse=", "), ". Restore with renv::restore().")
+suppressPackageStartupMessages({ library(TreeExp); library(ggplot2) })
+# ggplot2 4.x objects are S7, so their class vector starts with "ggplot2::ggplot".
+# A plain print() call can fall through to print.default(), which dumps the object
+# as text instead of drawing it. Explicit method lookup forces the plot renderer.
+draw_ggplot <- function(p) {
+  method <- tryCatch(getS3method("print", "ggplot2::ggplot"), error = function(e) NULL)
+  if (is.null(method)) method <- getS3method("print", "ggplot")
+  method(p)
+}
+resolve <- function(x) if (grepl("^[A-Za-z]:[/\\\\]|^/", x)) x else file.path(getwd(), x)
+input_la_tpm_file <- resolve(params$input_la_tpm_file)
+if (!file.exists(input_la_tpm_file) || is.na(file.info(input_la_tpm_file)$size) || file.info(input_la_tpm_file)$size <= 0) stop("Missing or empty filtered TPM matrix: ", input_la_tpm_file)
+tissue <- "LA"; outgroup_taxon <- "SUZ"; focus_taxon <- "ERE"; comparison_taxa <- c("SEC", "MEL", "SAN", "SIM")
+primary_comparison_taxa <- c("MEL", "SAN")
+genes_per_subset <- 500L; random_repeats <- 500L; random_seed <- 1L; set.seed(random_seed)
+if (!"alternative" %in% names(formals(TreeExp::RelaRate.test))) stop("Installed TreeExp::RelaRate.test does not expose an alternative argument.")
+```
+
+## Load and validate the LA expression matrix
+
+```{r load_la_expression}
+taxa_objects <- TreeExp::TEconstruct(ExpValueFP=input_la_tpm_file, taxa="all", subtaxa="all")
+exp_table <- TreeExp::exptabTE(objects=taxa_objects, taxa="all", subtaxa=tissue)
+colnames(exp_table) <- sub("_LA$", "", colnames(exp_table))
+required_taxa <- c(focus_taxon, comparison_taxa, outgroup_taxon)
+if (!all(required_taxa %in% colnames(exp_table))) stop("Missing required taxa: ", paste(setdiff(required_taxa, colnames(exp_table)), collapse=", "))
+if (anyDuplicated(rownames(exp_table))) stop("Duplicated gene identifiers detected in the expression table.")
+if (any(!is.finite(as.matrix(exp_table)))) stop("Non-finite values detected in the expression table.")
+cat("Genes:", nrow(exp_table), "\nSpecies columns:", paste(colnames(exp_table), collapse=", "), "\n")
+```
+
+## Full-data relative-rate tests
+
+```{r run_relative_rate_tests}
+comparison_table <- data.frame(species1=focus_taxon, species2=comparison_taxa, stringsAsFactors=FALSE)
+run_relarate_set <- function(
+  expression_table,
+  pairs,
+  warning_tracker = NULL,
+  replicate_id = NULL
+) {
+  out <- lapply(seq_len(nrow(pairs)), function(i) {
+    # Resampling can yield a negative estimated analytical variance. Count the
+    # resulting NaN warning by replicate/comparison and suppress only that known
+    # warning; all other warnings remain visible for diagnosis.
+    z <- withCallingHandlers(
+      TreeExp::RelaRate.test(expTable=expression_table, x=pairs$species1[i], y=pairs$species2[i], outgroup=outgroup_taxon, alternative="two.sided"),
+      warning = function(w) {
+        if (grepl("NaNs produced", conditionMessage(w), fixed = TRUE)) {
+          if (!is.null(warning_tracker) && !is.null(replicate_id)) {
+            warning_tracker$undefined_z[
+              replicate_id,
+              pairs$species2[i]
+            ] <- TRUE
+          }
+          tryInvokeRestart("muffleWarning")
+        }
+      }
+    )
+    data.frame(tissue=tissue, species1=pairs$species1[i], species2=pairs$species2[i], outgroup=outgroup_taxon, zscore=as.numeric(z[[1]]), hypothesis=as.character(z[[2]]), p_value=as.numeric(z[[3]]), direction=ifelse(as.numeric(z[[1]]) > 0, "ERE faster", ifelse(as.numeric(z[[1]]) < 0, "Comparator faster", "Undefined")), stringsAsFactors=FALSE)
+  })
+  out <- do.call(rbind, out); out$padj_holm <- p.adjust(out$p_value, method="holm"); out
+}
+tot_LA <- run_relarate_set(exp_table, comparison_table)
+tot_LA <- tot_LA[order(tot_LA$species2), , drop=FALSE]
+write.table(tot_LA, "treeexp_LA_ERE_relative_rate_results.txt", quote=FALSE, row.names=FALSE, col.names=TRUE, sep="\t")
+primary_results <- tot_LA[tot_LA$species2 %in% primary_comparison_taxa, , drop=FALSE]
+context_results <- tot_LA[!tot_LA$species2 %in% primary_comparison_taxa, , drop=FALSE]
+knitr::kable(primary_results, caption="Primary dissertation comparisons: ERE versus MEL and SAN")
+knitr::kable(context_results, caption="Broader ingroup context: ERE versus SEC and SIM")
+```
+
+## Full-data relative-rate plot
+
+```{r plot_full_tests, fig.cap="Full-data ERE relative-rate Z-scores for all four comparator species.", fig.alt="Point plot of ERE relative-rate Z-scores versus SEC, MEL, SAN, and SIM using SUZ as outgroup."}
+tot_LA$species2 <- factor(tot_LA$species2, levels=comparison_taxa)
+p_full_tests <- ggplot(tot_LA, aes(x=species2, y=zscore, colour=direction)) + geom_hline(yintercept=0, linetype="dashed") + geom_point(size=3) + coord_flip() + theme_classic() + labs(title="ERE relative-rate tests in LA", subtitle="Primary comparisons are MEL and SAN; SEC and SIM provide broader context", x="Species compared with ERE", y="Z-score", colour=NULL)
+draw_ggplot(p_full_tests)
+ggsave("treeexp_LA_ERE_full_relative_rate_tests.png", p_full_tests, width=6, height=4, dpi=300)
+```
+
+## Random-subset sensitivity analysis
+
+```{r random_500_gene_tests}
+if (nrow(exp_table) < genes_per_subset) stop("Not enough genes for ", genes_per_subset, "-gene subsets.")
+sampled_results <- vector("list", random_repeats)
+warning_tracker <- new.env(parent = emptyenv())
+warning_tracker$undefined_z <- matrix(
+  FALSE,
+  nrow = random_repeats,
+  ncol = nrow(comparison_table),
+  dimnames = list(NULL, comparison_table$species2)
+)
+for (replicate_id in seq_len(random_repeats)) {
+  ids <- sample(rownames(exp_table), genes_per_subset, replace=FALSE)
+  one <- run_relarate_set(
+    exp_table[ids, , drop=FALSE],
+    comparison_table,
+    warning_tracker = warning_tracker,
+    replicate_id = replicate_id
+  ); one$replicate <- replicate_id; one$sampled_genes <- genes_per_subset; sampled_results[[replicate_id]] <- one
+}
+sampled_LA <- do.call(rbind, sampled_results); write.table(sampled_LA, "treeexp_LA_ERE_500_gene_500_repeats.txt", quote=FALSE, row.names=FALSE, col.names=TRUE, sep="\t")
+sampled_finite <- sampled_LA[is.finite(sampled_LA$zscore), , drop=FALSE]
+
+# Replace hundreds of identical raw warnings with one auditable line per
+# comparison. The existing is.finite() filter below remains the sole exclusion
+# rule for summaries, so this changes display only, not the statistics.
+for (comparison_species in comparison_table$species2) {
+  undefined_count <- sum(warning_tracker$undefined_z[, comparison_species])
+  cat(sprintf(
+    paste0(
+      "ERE vs %s: %d replicates run, %d had an undefined analytical Z-score ",
+      "(%.1f%%) due to negative estimated variance; these were excluded ",
+      "from the summaries below.\n"
+    ),
+    comparison_species,
+    random_repeats,
+    undefined_count,
+    100 * undefined_count / random_repeats
+  ))
+}
+
+subset_summary <- do.call(rbind, lapply(split(sampled_finite, sampled_finite$species2), function(x) data.frame(species2=as.character(x$species2[1]), n=nrow(x), median=median(x$zscore), lower_95=quantile(x$zscore,.025), upper_95=quantile(x$zscore,.975), proportion_positive=mean(x$zscore>0), undefined_z_rate=1-nrow(x)/random_repeats)))
+write.table(subset_summary, "treeexp_LA_ERE_subset_stability_summary.txt", quote=FALSE, row.names=FALSE, col.names=TRUE, sep="\t"); subset_summary
+```
+
+## Subset-size sensitivity
+
+```{r subset_size_sensitivity}
+subset_sizes <- c(500L, 1000L, 2000L)
+summarise_subset_size <- function(x, size) {
+  pieces <- split(x, x$species2)
+  do.call(rbind, lapply(pieces, function(one) {
+    z <- one$zscore
+    data.frame(sampled_genes = size, species2 = as.character(one$species2[1]), n = nrow(one), median = median(z, na.rm = TRUE), lower_95 = unname(quantile(z, .025, na.rm = TRUE)), upper_95 = unname(quantile(z, .975, na.rm = TRUE)), proportion_positive = mean(z > 0, na.rm = TRUE), undefined_z_rate = mean(!is.finite(z)))
+  }))
+}
+# Reuse the 500-gene result already generated with all random_repeats replicates.
+subset_size_results <- list(`500` = summarise_subset_size(sampled_LA, 500L))
+for (size in setdiff(subset_sizes, 500L)) {
+  if (nrow(exp_table) < size) next
+  runs <- lapply(seq_len(random_repeats), function(i) {
+    one <- run_relarate_set(exp_table[sample(rownames(exp_table), size), , drop = FALSE], comparison_table)
+    one$replicate <- i
+    one
+  })
+  subset_size_results[[as.character(size)]] <- summarise_subset_size(do.call(rbind, runs), size)
+}
+subset_size_summary <- do.call(rbind, subset_size_results)
+write.table(subset_size_summary, "treeexp_LA_ERE_subset_size_sensitivity_summary.txt", quote=FALSE, row.names=FALSE, col.names=TRUE, sep="\t"); subset_size_summary
+```
+
+## Random-subset visualisation
+
+The points are red, matching the plotted colour. The display uses the observed data range rather than silently clipping values to fixed limits.
+
+```{r plot_all_random_zscores, fig.cap="Relative-rate Z-scores from random 500-gene subsets.", fig.alt="Jittered red points showing random-subset relative-rate Z-scores for each ERE comparison."}
+sampled_LA_finite <- sampled_LA[is.finite(sampled_LA$zscore), , drop=FALSE]
+p_all_random_zscores <- ggplot(sampled_LA_finite, aes(x=species2, y=zscore)) + geom_hline(yintercept=0, linetype="dashed") + geom_jitter(colour="red", width=.15, alpha=.5, size=.8) + coord_flip() + theme_classic() + labs(title="ERE relative-rate z-score distributions from 500-gene subsets", x="Species compared with ERE", y="Z-score")
+draw_ggplot(p_all_random_zscores); ggsave("treeexp_LA_ERE_all_random_zscores.png", p_all_random_zscores, width=7, height=4, dpi=300)
+```
+
+## ERE-versus-SAN subset distribution
+
+```{r plot_random_zscores, fig.cap="Distribution of ERE-versus-SAN relative-rate Z-scores across random 500-gene subsets.", fig.alt="Histogram of ERE-versus-SAN relative-rate Z-scores from random 500-gene subsets, with the full-data estimate marked in red."}
+san_subsets <- sampled_LA_finite[sampled_LA_finite$species2 == "SAN", , drop=FALSE]
+san_full <- tot_LA[tot_LA$species2 == "SAN", , drop=FALSE]
+p_san_random_zscores <- ggplot(san_subsets, aes(x=zscore)) + geom_histogram(binwidth=1, boundary=0, fill="grey75", colour="white") + geom_vline(xintercept=0, linetype="dashed") + geom_vline(data=san_full, aes(xintercept=zscore), colour="firebrick") + theme_classic() + labs(title="ERE versus SAN subset Z-scores", subtitle="Red line = full filtered transcriptome", x="Relative-rate Z-score", y="Number of subsets")
+draw_ggplot(p_san_random_zscores)
+ggsave("treeexp_LA_ERE_vs_SAN_random_500_gene_zscore_distribution.png", p_san_random_zscores, width=7, height=4, dpi=300)
+```
+## Compact subset stability plot
+
+```{r compact_interval_plot, fig.cap="Central 95% range of random-subset Z-scores compared with the full-data estimate.", fig.alt="Horizontal ranges showing the central 95% random-subset Z-score distribution and full-data ERE estimate."}
+subset_interval_summary <- do.call(rbind, lapply(split(sampled_LA_finite, sampled_LA_finite$species2), function(x) data.frame(species2=as.character(x$species2[1]), subset_median=median(x$zscore), subset_lower_95=quantile(x$zscore,.025), subset_upper_95=quantile(x$zscore,.975))))
+z_interval_summary <- merge(subset_interval_summary, tot_LA[,c("species2","zscore")], by="species2", all.x=TRUE); names(z_interval_summary)[names(z_interval_summary)=="zscore"] <- "full_z_score"
+compact_interval_plot <- ggplot(z_interval_summary, aes(y=species2)) + geom_segment(aes(x=subset_lower_95,xend=subset_upper_95,yend=species2), colour="steelblue4", linewidth=.9) + geom_point(aes(x=subset_median), colour="steelblue4", size=2) + geom_point(aes(x=full_z_score), colour="firebrick", size=3) + geom_vline(xintercept=0, linetype="dashed") + theme_minimal() + labs(title="Full-data Z-score and central 95% random-subset range", subtitle="Blue = central 95% of subsets; red = full filtered transcriptome", x="Relative-rate Z-score", y="Species pair")
+draw_ggplot(compact_interval_plot); write.table(z_interval_summary, "treeexp_LA_ERE_500_subset_interval_summary.txt", quote=FALSE, row.names=FALSE, col.names=TRUE, sep="\t"); ggsave("treeexp_LA_ERE_500_subset_vs_full_interval_plot.png", compact_interval_plot, width=10, height=4, dpi=300)
+```
+
+## Interpretation
+
+Positive Z-scores support faster ERE transcriptome divergence relative to the named comparator. These statistics do not identify causal genes, prove altered brain function, or establish that any divergence is adaptive to Pandanus-fruit-specialist ecology.
+
+## Reproducibility
+
+<details><summary>Session information</summary>
+
+```{r session_info}
+sessionInfo()
+```
+
+</details>

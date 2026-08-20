@@ -1,0 +1,433 @@
+﻿---
+title: "03. Bootstrap Whole-Transcriptome Tree"
+author: "Candice Charles"
+date: "`r Sys.Date()`"
+params:
+  input_tpm_file: "../../File_S3_spp_tpm_1to1s.txt"
+  output_dir: "results/treeexp"
+  tree_bootstrap_replicates: 100
+  seed: 1
+output:
+  html_document:
+    self_contained: true
+    toc: true
+    toc_float: true
+    number_sections: false
+    code_folding: hide
+    mathjax: null
+---
+
+This analysis constructs a six-species larval-expression tree from stationary Ornstein-Uhlenbeck (OU) expression distances. It uses *Drosophila suzukii* (`SUZ_LA`) as the fixed outgroup and quantifies branch-support values by resampling genes with replacement.
+
+## 1. Read, validate, and prepare the input
+
+```{r setup}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.align = "center", fig.width = 9, fig.height = 6, fig.retina = 2
+)
+
+suppressPackageStartupMessages({
+  library(TreeExp)
+  library(ape)
+})
+
+input_tpm_file <- params$input_tpm_file
+output_dir <- params$output_dir
+tree_bootstrap_replicates <- as.integer(params$tree_bootstrap_replicates)
+analysis_seed <- as.integer(params$seed)
+set.seed(analysis_seed)
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+# The file check fails early with an actionable message instead of a read.table error.
+if (!file.exists(input_tpm_file)) {
+  stop("The TPM input file specified by params$input_tpm_file does not exist.")
+}
+# At least one replicate is required for a meaningful support estimate.
+if (!is.finite(tree_bootstrap_replicates) || tree_bootstrap_replicates < 1L) {
+  stop("tree_bootstrap_replicates must be a positive integer.")
+}
+
+species <- c("ERE", "MEL", "SAN", "SEC", "SIM", "SUZ")
+tissue <- "LA"
+outgroup_taxon <- "SUZ_LA"
+
+detect_duplicate_gene_symbols <- function(species_tpm) {
+  # Compare repaired, orthogroup-stripped symbols so encoding variants can be
+  # identified without altering the original identifiers in the audit report.
+  original_ids <- rownames(species_tpm)
+
+  normalise_gene_symbol <- function(ids) {
+    ids <- enc2utf8(as.character(ids))
+    replacements <- c(
+      "\u00c3\u017d\u00c2\u00b5" = "epsilon",
+      "\u00ce\u00b5" = "epsilon", "\u03b5" = "epsilon",
+      "\u00c3\u017d\u00c2\u00b1" = "alpha",
+      "\u00ce\u00b1" = "alpha", "\u03b1" = "alpha",
+      "\u00c3\u017d\u00c2\u00b2" = "beta",
+      "\u00ce\u00b2" = "beta", "\u03b2" = "beta",
+      "\u00c3\u017d\u00c2\u00b3" = "gamma",
+      "\u00ce\u00b3" = "gamma", "\u03b3" = "gamma"
+    )
+    for (bad_symbol in names(replacements)) {
+      ids <- gsub(bad_symbol, replacements[[bad_symbol]], ids, fixed = TRUE)
+    }
+    # Remove one or more terminal orthogroup tags only after symbol repair.
+    ids <- sub("(_OG[[:alnum:]-]+)+$", "", ids, ignore.case = TRUE)
+    tolower(gsub("[^[:alnum:]]", "", ids))
+  }
+
+  normalised_ids <- normalise_gene_symbol(original_ids)
+  candidate_groups <- split(seq_along(original_ids), normalised_ids)
+  candidate_groups <- candidate_groups[lengths(candidate_groups) > 1]
+  # These characters are a compact screen for common UTF-8/Latin-1 mojibake.
+  mojibake <- grepl("[\u00c2\u00c3\u00ce\u017d]", original_ids)
+  rows_to_drop <- integer(0)
+  report_rows <- list()
+
+  for (group_name in names(candidate_groups)) {
+    idx <- candidate_groups[[group_name]]
+    clean_idx <- idx[!mojibake[idx]]
+    corrupted_idx <- idx[mojibake[idx]]
+
+    # Resolve only groups with one clean representative; multiple clean IDs may
+    # be genuine paralogs, so ambiguous groups are retained for manual review.
+    can_resolve <- length(clean_idx) == 1 && length(corrupted_idx) >= 1
+    if (can_resolve) rows_to_drop <- c(rows_to_drop, corrupted_idx)
+
+    for (i in idx) {
+      decision <- if (can_resolve && i %in% corrupted_idx) {
+        "drop_corrupted_duplicate"
+      } else if (can_resolve) {
+        "keep_preferred_encoding"
+      } else {
+        "manual_review_no_merge"
+      }
+      reason <- if (can_resolve && i %in% corrupted_idx) {
+        paste0("Mis-encoded symbol duplicates preferred row ", original_ids[clean_idx], ".")
+      } else if (can_resolve) {
+        "Only cleanly encoded representative in this normalised-symbol group."
+      } else {
+        "More than one plausible clean identifier; may represent distinct paralogs."
+      }
+      # candidate_type distinguishes orthogroup/paralog-style IDs from symbols
+      # in the exported QC table; it does not determine automatic removal.
+      report_rows[[length(report_rows) + 1]] <- data.frame(
+        original_id = original_ids[i],
+        normalised_id = group_name,
+        duplicate_group_size = length(idx),
+        encoding_status = if (mojibake[i]) "mis_encoded" else "valid_or_ascii",
+        decision = decision,
+        reason = reason,
+        species_tpm[i, , drop = FALSE],
+        check.names = FALSE,
+        stringsAsFactors = FALSE
+      )
+    }
+  }
+
+  empty_report <- data.frame(
+    original_id = character(), normalised_id = character(),
+    duplicate_group_size = integer(), encoding_status = character(),
+    decision = character(), reason = character(), stringsAsFactors = FALSE
+  )
+  report <- if (length(report_rows)) do.call(rbind, report_rows) else empty_report
+  # Label the identifier class so orthogroup candidates can be reviewed separately
+  # from ordinary gene-symbol encoding issues.
+  # candidate_type distinguishes orthogroup/paralog-style IDs from symbols in the audit.
+  report$candidate_type <- ifelse(
+    grepl("_OG", report$original_id, fixed = TRUE),
+    "paralog_or_orthogroup_candidate",
+    "gene_symbol_candidate"
+  )
+  cleaned_data <- if (length(rows_to_drop)) {
+    species_tpm[-unique(rows_to_drop), , drop = FALSE]
+  } else {
+    species_tpm
+  }
+
+  list(
+    cleaned_data = cleaned_data,
+    report = report,
+    dropped_ids = original_ids[unique(rows_to_drop)]
+  )
+}
+
+# Read the raw matrix as character data first so failed numeric conversions and
+# literal missing values can be identified instead of being silently coerced.
+utf8_lines <- readLines(input_tpm_file, encoding = "UTF-8", warn = FALSE)
+tpm_raw <- read.table(
+  text = paste(utf8_lines, collapse = "
+"),
+  header = TRUE,
+  sep = "\t",
+  quote = "",
+  comment.char = "",
+  check.names = FALSE,
+  stringsAsFactors = FALSE,
+  colClasses = "character"
+)
+## A gene column plus samples is the minimum structure needed for expression distances.
+if (ncol(tpm_raw) < 2L) stop("The TPM matrix must contain a gene column and sample columns.")
+
+gene_ids <- enc2utf8(as.character(tpm_raw[[1]]))
+if (anyNA(gene_ids) || any(!nzchar(trimws(gene_ids)))) stop("Gene IDs contain missing or empty values.")
+# Unique IDs are required because row names identify expression profiles and
+# duplicated IDs would make downstream gene-level distances ambiguous.
+if (anyDuplicated(gene_ids)) {
+  duplicated_ids <- unique(gene_ids[duplicated(gene_ids)])
+  duplicate_id_report <- data.frame(gene_id = head(duplicated_ids, 100), stringsAsFactors = FALSE)
+  write.csv(duplicate_id_report, file = file.path(output_dir, "duplicate_gene_ids.csv"), row.names = FALSE)
+  stop("Duplicated gene IDs detected; see results/treeexp/duplicate_gene_ids.csv.")
+}
+
+sample_names <- names(tpm_raw)[-1]
+expected_la_pattern <- paste0("^(", paste(species, collapse = "|"), ")_", tissue, "_[0-9]+$")
+la_columns <- grep(expected_la_pattern, sample_names, value = TRUE)
+if (length(la_columns) == 0L) stop("No LA replicate columns matching the six expected species were found.")
+unexpected_la <- setdiff(grep("_LA(_|$)", sample_names, value = TRUE), la_columns)
+if (length(unexpected_la) > 0L) stop("Unexpected LA columns detected: ", paste(unexpected_la, collapse = ", "))
+replicate_counts <- table(sub("_LA_[0-9]+$", "", la_columns))
+missing_species <- setdiff(species, names(replicate_counts))
+if (length(missing_species) > 0L) stop("Missing LA columns for species: ", paste(missing_species, collapse = ", "))
+# Exactly three replicates per species gives a balanced mean and matches the
+# intended biological design; an imbalance would change the weighting of taxa.
+if (any(replicate_counts != 3L)) stop("Expected exactly three LA replicates per species; observed: ", paste(names(replicate_counts), replicate_counts, sep = "=", collapse = ", "))
+
+numeric_tpm <- lapply(tpm_raw[la_columns], function(x) suppressWarnings(as.numeric(x)))
+conversion_failures <- vapply(seq_along(la_columns), function(i) any(!is.na(tpm_raw[[la_columns[i]]]) & is.na(numeric_tpm[[i]])), logical(1))
+if (any(conversion_failures)) stop("Non-numeric TPM values detected in columns: ", paste(la_columns[conversion_failures], collapse = ", "))
+tpm_matrix <- as.matrix(as.data.frame(numeric_tpm, check.names = FALSE))
+rownames(tpm_matrix) <- gene_ids
+## Missing values cannot be averaged or passed safely to TreeExp distance calculations.
+if (anyNA(tpm_matrix)) stop("Missing TPM values remain after input conversion.")
+## Infinite values would dominate means and distances, so they are rejected explicitly.
+if (any(!is.finite(tpm_matrix))) stop("Infinite TPM values detected in the input matrix.")
+# TPM is a non-negative abundance measure, so negative values indicate invalid
+# input rather than a biological signal that can be passed to TreeExp.
+if (any(tpm_matrix < 0)) stop("Negative TPM values detected in the input matrix.")
+
+cat("Input genes:", nrow(tpm_matrix), "
+")
+cat("Species:", length(species), "
+")
+cat("LA replicates per species:", paste(names(replicate_counts), replicate_counts, sep = "=", collapse = ", "), "
+")
+```
+
+## 2. Average LA replicates and perform gene-symbol QC
+
+The three LA replicates for each species are averaged without 
+a.rm = TRUE`, because missing replicates are a validation failure rather than values that should be silently discarded. Gene-symbol QC classifies exact duplicate IDs, encoding-corrupted entries, duplicate normalised symbols, and orthogroup/paralog candidates. Only a corrupted row with one unambiguous clean representative is removed automatically; all ambiguous groups are exported for manual review.
+
+```{r species_mean_la_tpm}
+species_la_tpm <- sapply(species, function(sp) {
+  sp_la_columns <- grep(paste0("^", sp, "_", tissue, "(_|$)"), colnames(tpm_matrix), value = TRUE)
+  rowMeans(tpm_matrix[, sp_la_columns, drop = FALSE])
+})
+species_la_tpm <- as.data.frame(species_la_tpm, check.names = FALSE)
+names(species_la_tpm) <- paste(species, tissue, sep = "_")
+rownames(species_la_tpm) <- rownames(tpm_matrix)
+
+duplicate_symbol_report <- detect_duplicate_gene_symbols(species_la_tpm)
+write.csv(duplicate_symbol_report$report, file = file.path(output_dir, "duplicate_or_mis_encoded_gene_symbols.csv"), row.names = FALSE)
+if (length(duplicate_symbol_report$dropped_ids)) {
+  species_la_tpm <- duplicate_symbol_report$cleaned_data
+} else {
+  species_la_tpm <- duplicate_symbol_report$cleaned_data
+}
+cat("Genes after identifier QC:", nrow(species_la_tpm), "
+")
+cat("Rows retained for manual duplicate/paralog review:", nrow(duplicate_symbol_report$report), "
+")
+```
+
+## 3. Filter genes by mean TPM > 1 in every species
+
+The filter uses a logical mask and preserves the original species-level TPM values for the removal audit. A gene is retained only when all six species have a finite mean TPM greater than 1. The log2(TPM + 1) transformation is applied only after this filter, because filtering on transformed or overwritten values would obscure the original expression measurements.
+
+```{r filter_tpm_gt1_all_species}
+species_tpm_matrix <- as.matrix(species_la_tpm)
+# Apply the threshold to raw mean TPM values before log2 transformation; doing
+# this after transformation would change the scale and obscure the audit.
+failed_filter_mask <- !is.finite(species_tpm_matrix) | is.na(species_tpm_matrix) | species_tpm_matrix <= 1
+keep_gene <- rowSums(failed_filter_mask) == 0L
+species_la_tpm_gt1 <- species_la_tpm[keep_gene, , drop = FALSE]
+removed_gene_report <- data.frame(
+  gene = rownames(species_la_tpm)[!keep_gene],
+  species_la_tpm[!keep_gene, , drop = FALSE],
+  failed_species = apply(failed_filter_mask[!keep_gene, , drop = FALSE], 1, function(x) paste(colnames(species_tpm_matrix)[x], collapse = ", ")),
+  row.names = NULL,
+  check.names = FALSE
+)
+species_exp_log2 <- log2(as.matrix(species_la_tpm_gt1) + 1)
+
+write.csv(removed_gene_report, file = file.path(output_dir, "genes_removed_by_TPM_filter.csv"), row.names = FALSE)
+cat("Genes before TPM filter:", nrow(species_la_tpm), "
+")
+cat("Genes retained (mean TPM > 1 in all species):", nrow(species_la_tpm_gt1), "
+")
+cat("Genes removed by TPM filter:", nrow(removed_gene_report), "
+")
+```
+
+## 4. Create TreeExp objects and validate the expression table
+
+The filtered species-level LA matrix is written to a controlled output location and supplied to TreeExp. The resulting expression table is checked for exactly six species-level LA taxa and finite values before distances are computed.
+
+```{r create_treeexp_objects}
+treeexp_input_file <- file.path(output_dir, "treeexp_LA_TPM_gt1_all_species.txt")
+treeexp_input <- cbind(gene = rownames(species_la_tpm_gt1), species_la_tpm_gt1)
+write.table(treeexp_input, file = treeexp_input_file, sep = "\t", quote = FALSE, row.names = FALSE, col.names = TRUE)
+
+taxa_objects <- TreeExp::TEconstruct(
+  ExpValueFP = treeexp_input_file,
+  taxa = species,
+  subtaxa = tissue
+)
+# TEconstruct packages the filtered expression file into TreeExp's taxa object;
+# exptabTE extracts the gene-by-taxon table used by the distance functions.
+expression_table <- TreeExp::exptabTE(objects = taxa_objects, taxa = "all", subtaxa = tissue)
+# Rechecking expected_taxa catches silent column-name or orientation problems
+# before any distance or tree calculation uses the expression table.
+expected_taxa <- paste(species, tissue, sep = "_")
+if (!all(expected_taxa %in% colnames(expression_table))) stop("TreeExp expression table is missing expected species/tissue taxa.")
+if (any(!is.finite(as.matrix(expression_table[, expected_taxa, drop = FALSE])))) stop("TreeExp expression table contains non-finite values.")
+cat("Validated TreeExp taxa:", paste(expected_taxa, collapse = ", "), "
+")
+```
+
+## 5. Compute stationary OU expression distances
+
+TreeExp's stationary OU distance summarizes expression-profile divergence between each pair of species-level LA taxa. The full six-taxon distance matrix is written to a file and only a compact summary is displayed in the report.
+
+```{r expression_distance}
+dist_sou <- TreeExp::expdist(
+  taxa_objects,
+  taxa = "all",
+  subtaxa = tissue,
+  method = "sou"
+)
+if (!all(expected_taxa %in% rownames(dist_sou)) || !all(expected_taxa %in% colnames(dist_sou))) stop("The OU distance matrix does not contain all six expected taxa.")
+dist_sou <- dist_sou[expected_taxa, expected_taxa, drop = FALSE]
+write.csv(dist_sou, file = file.path(output_dir, "sou_distance_matrix.csv"), row.names = TRUE)
+cat("Distance matrix dimensions:", nrow(dist_sou), "x", ncol(dist_sou), "
+")
+```
+
+## 6. Build and root the transcriptomic tree
+
+A neighbour-joining tree is constructed from the stationary OU distances. The unrooted tree is retained for reference, then rooted with `SUZ_LA`. Rooting defines the display and outgroup orientation; it does not establish an evolutionary species phylogeny.
+
+```{r neighbour_joining_tree, fig.cap="Unrooted and rooted phylograms built from stationary OU expression distances across six species-level LA taxa; the tree is rooted with *Drosophila suzukii* (SUZ_LA).", fig.alt="Phylogram showing six species-level larval expression taxa with branch lengths proportional to stationary OU expression distances; SUZ_LA is the designated outgroup."}
+tree_unrooted <- ape::nj(as.dist(dist_sou))
+if (!outgroup_taxon %in% tree_unrooted$tip.label) stop("The selected outgroup SUZ_LA is absent from the unrooted tree.")
+tree_rooted <- ape::root(tree_unrooted, outgroup = outgroup_taxon, resolve.root = TRUE)
+ape::write.tree(tree_unrooted, file = file.path(output_dir, "tree_unrooted_NJ.nwk"))
+ape::write.tree(tree_rooted, file = file.path(output_dir, "tree_rooted_SUZ_outgroup.nwk"))
+plot(tree_rooted, type = "phylogram", use.edge.length = TRUE, main = "Rooted phylogram from stationary OU distances")
+```
+
+## 7. Bootstrap the rooted tree
+
+`TreeExp::boot.exphy()` resamples genes with replacement, recomputes the requested expression distance for each replicate, builds an NJ tree, and passes `outgroup` to TreeExp's internal bootstrap-tree function. In the installed TreeExp implementation, this argument roots each bootstrap replicate with `ape::root(..., resolve.root = TRUE)`; it is not merely a tip relabelling operation. For a rooted reference tree, the returned values are rooted clade proportions. The support vector is checked against the number of internal nodes before labels are attached. Approximately 1,000 replicates are recommended for the final dissertation run; the parameter can be smaller for development iterations.
+
+```{r bootstrap_tree}
+# exptabTE() supplies genes as rows and taxa as columns, the orientation expected
+# by boot.exphy() after its internal transpose.
+# boot.exphy() resamples genes and rebuilds a tree for each replicate. outgroup
+# roots each replicate, rooted requests rooted support, and jumble randomises
+# resampling order to reduce order-dependent effects.
+bootstrap_values <- TreeExp::boot.exphy(
+  phy = tree_rooted,
+  x = species_exp_log2,
+  outgroup = outgroup_taxon,
+  method = "sou",
+  B = tree_bootstrap_replicates,
+  quiet = TRUE,
+  rooted = TRUE,
+  jumble = TRUE,
+  mc.cores = 1
+)
+if (is.list(bootstrap_values) && "BP" %in% names(bootstrap_values)) bootstrap_support <- bootstrap_values$BP else bootstrap_support <- bootstrap_values
+# One support value is required for every internal node before attaching labels;
+# this prevents a misaligned vector from being silently misreported.
+stopifnot(length(bootstrap_support) == ape::Nnode(tree_rooted))
+tree_rooted_bootstrapped <- tree_rooted
+tree_rooted_bootstrapped$node.label <- bootstrap_support
+write.csv(
+  data.frame(node = seq_along(bootstrap_support), bootstrap = bootstrap_support),
+  file = file.path(output_dir, "bootstrap_support_values.csv"),
+  row.names = FALSE
+)
+cat("Bootstrap replicates completed:", tree_bootstrap_replicates, "
+")
+```
+
+## 8. Plot and export phylogram and cladogram
+
+`rotateConstr()` changes only the visual ordering of tips; it does not change topology, branch lengths, or bootstrap support. The phylogram retains actual OU-distance branch lengths, whereas the cladogram suppresses branch-length information and is therefore a topology-only display.
+
+```{r plot_phylogram, fig.cap="Rooted bootstrapped phylogram with stationary OU branch lengths and bootstrap support labels.", fig.alt="Rooted phylogram of six species-level larval expression taxa with SUZ_LA as outgroup, branch lengths representing stationary OU distances, and internal bootstrap support labels."}
+tree_phylogram <- tree_rooted_bootstrapped
+# Map short species codes to full names before rotateConstr(); the constraint
+# must match the actual tip labels or no reordering can be applied.
+species_full_names <- c(
+  ERE = "Drosophila erecta", MEL = "Drosophila melanogaster",
+  SAN = "Drosophila santomea", SEC = "Drosophila sechellia",
+  SIM = "Drosophila simulans", SUZ = "Drosophila suzukii"
+)
+species_code <- sub("_LA$", "", tree_phylogram$tip.label)
+tree_phylogram$tip.label <- unname(species_full_names[species_code])
+tree_phylogram <- ape::rotateConstr(
+  tree_phylogram,
+  constraint = species_full_names[c("SANTOMEA", "SECHELLIA", "MELANOGASTER", "SIMULANS", "ERECTA", "SUZUKII")]
+)
+plot(tree_phylogram, type = "phylogram", use.edge.length = TRUE, show.node.label = TRUE, main = paste0("Rooted OU phylogram (", tree_bootstrap_replicates, " bootstrap replicates)"), font = 3, cex = 1.1)
+ape::write.tree(tree_phylogram, file = file.path(output_dir, "tree_rooted_bootstrapped_phylogram.nwk"))
+png(file.path(output_dir, "tree_rooted_bootstrapped_phylogram.png"), width = 1200, height = 800, res = 150)
+plot(tree_phylogram, type = "phylogram", use.edge.length = TRUE, show.node.label = TRUE, main = paste0("Rooted OU phylogram (", tree_bootstrap_replicates, " bootstrap replicates)"), font = 3, cex = 1.1)
+invisible(dev.off())
+```
+
+```{r plot_cladogram, fig.cap="Rooted bootstrapped cladogram showing topology and bootstrap support; branch-length information is intentionally suppressed.", fig.alt="Rooted cladogram of six species-level larval expression taxa with SUZ_LA as outgroup and internal bootstrap support labels; branch lengths are not interpreted."}
+tree_cladogram <- tree_phylogram
+plot(tree_cladogram, type = "cladogram", use.edge.length = FALSE, show.node.label = TRUE, main = paste0("Rooted OU cladogram (", tree_bootstrap_replicates, " bootstrap replicates; branch lengths suppressed)"), font = 3, cex = 1.1)
+ape::write.tree(tree_cladogram, file = file.path(output_dir, "tree_rooted_bootstrapped_cladogram.nwk"))
+png(file.path(output_dir, "tree_rooted_bootstrapped_cladogram.png"), width = 1200, height = 800, res = 150)
+plot(tree_cladogram, type = "cladogram", use.edge.length = FALSE, show.node.label = TRUE, main = paste0("Rooted OU cladogram (", tree_bootstrap_replicates, " bootstrap replicates; branch lengths suppressed)"), font = 3, cex = 1.1)
+invisible(dev.off())
+```
+
+## 9. Summary and interpretation
+
+```{r summary}
+summary_table <- data.frame(
+  species_count = length(species),
+  la_replicates_per_species = 3L,
+  genes_before_filter = nrow(species_la_tpm),
+  genes_after_filter = nrow(species_la_tpm_gt1),
+  stationary_ou_method = "sou",
+  outgroup = outgroup_taxon,
+  bootstrap_replicates = tree_bootstrap_replicates,
+  random_seed = analysis_seed
+)
+knitr::kable(summary_table, caption = "Analysis summary")
+cat("This expression tree summarises similarity and divergence among species-level LA expression profiles using stationary OU distances. It is not an inferred species phylogeny and does not by itself establish evolutionary ancestry.
+")
+```
+
+## 10. Reproducibility
+
+```{r reproducibility}
+cat("Analysis reproducibility summary:\n")
+print(data.frame(analysis_date=format(Sys.Date()),input_filename=basename(input_tpm_file),bootstrap_replicates=tree_bootstrap_replicates,random_seed=analysis_seed,R_version=R.version.string,TreeExp_version=as.character(utils::packageVersion("TreeExp")),ape_version=as.character(utils::packageVersion("ape")),stringsAsFactors=FALSE))
+```
+
+
+
+
+
+
+
+
